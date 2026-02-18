@@ -10,7 +10,6 @@
 
 (import jax/buffer :as buf)
 (import jax/command)
-(def defcmd :macro (get-in (curenv) ['command/defcmd :value]))
 (import jax/editor :as editor)
 (import jax/hook)
 (import jax/keymap)
@@ -1192,19 +1191,19 @@
 
 # --- Commit transient ---
 
-(defcmd git-commit-create
+(command/defcmd git-commit-create
   "Create a new commit."
   :label "Commit"
   []
   (use-buffer-root) (open-commit-buffer))
 
-(defcmd git-commit-amend
+(command/defcmd git-commit-amend
   "Amend the last commit."
   :label "Amend"
   []
   (use-buffer-root) (open-commit-buffer true))
 
-(defcmd git-commit-fixup
+(command/defcmd git-commit-fixup
   "Create a fixup commit."
   :label "Fixup"
   []
@@ -1219,7 +1218,7 @@
              (when status-buf (do-status-refresh status-buf)))
          (editor-message (string "Fixup failed: " (result :stderr)))))}))
 
-(defcmd git-commit-reword
+(command/defcmd git-commit-reword
   "Reword the last commit message."
   :label "Reword"
   []
@@ -1254,7 +1253,7 @@
 
 # --- Branch transient ---
 
-(defcmd git-branch-checkout
+(command/defcmd git-branch-checkout
   "Checkout a branch."
   :label "Checkout Branch"
   []
@@ -1272,7 +1271,7 @@
              (when status-buf (do-status-refresh status-buf)))
          (editor-message (string "Checkout failed: " (result :stderr)))))}))
 
-(defcmd git-branch-create-and-checkout
+(command/defcmd git-branch-create-and-checkout
   "Create a new branch and check it out."
   :label "Create & Checkout"
   []
@@ -1288,7 +1287,7 @@
              (when status-buf (do-status-refresh status-buf)))
          (editor-message (string "Failed: " (result :stderr)))))}))
 
-(defcmd git-branch-create
+(command/defcmd git-branch-create
   "Create a new branch."
   :label "Create Branch"
   []
@@ -1302,7 +1301,7 @@
          (editor-message (string "Created branch " name))
          (editor-message (string "Failed: " (result :stderr)))))}))
 
-(defcmd git-branch-rename
+(command/defcmd git-branch-rename
   "Rename a branch."
   :label "Rename Branch"
   []
@@ -1323,7 +1322,7 @@
                   (when status-buf (do-status-refresh status-buf)))
               (editor-message (string "Failed: " (result :stderr)))))}))}))
 
-(defcmd git-branch-delete
+(command/defcmd git-branch-delete
   "Delete a branch."
   :label "Delete Branch"
   []
@@ -1361,7 +1360,7 @@
 
 # --- Push transient ---
 
-(defcmd git-push-pushremote
+(command/defcmd git-push-pushremote
   "Push to push remote."
   :label "Push"
   []
@@ -1378,7 +1377,7 @@
         (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Push failed: " (result :stderr)))))
 
-(defcmd git-push-other
+(command/defcmd git-push-other
   "Push to another remote."
   :label "Push to Other"
   []
@@ -1415,7 +1414,7 @@
 
 # --- Pull transient ---
 
-(defcmd git-pull-default
+(command/defcmd git-pull-default
   "Pull from upstream."
   :label "Pull"
   []
@@ -1431,7 +1430,7 @@
         (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Pull failed: " (result :stderr)))))
 
-(defcmd git-pull-other
+(command/defcmd git-pull-other
   "Pull from another remote."
   :label "Pull from Other"
   []
@@ -1468,7 +1467,7 @@
 
 # --- Fetch transient ---
 
-(defcmd git-fetch-default
+(command/defcmd git-fetch-default
   "Fetch from upstream."
   :label "Fetch"
   []
@@ -1484,7 +1483,7 @@
         (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Fetch failed: " (result :stderr)))))
 
-(defcmd git-fetch-other
+(command/defcmd git-fetch-other
   "Fetch from another remote."
   :label "Fetch from Other"
   []
@@ -1516,7 +1515,7 @@
 
 # --- Stash transient ---
 
-(defcmd git-stash-save
+(command/defcmd git-stash-save
   "Save changes to stash."
   :label "Stash Save"
   []
@@ -1539,7 +1538,7 @@
              (when status-buf (do-status-refresh status-buf)))
          (editor-message (string "Stash failed: " (result :stderr)))))}))
 
-(defcmd git-stash-pop
+(command/defcmd git-stash-pop
   "Pop the top stash."
   :label "Stash Pop"
   []
@@ -1551,7 +1550,7 @@
         (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Stash pop failed: " (result :stderr)))))
 
-(defcmd git-stash-apply
+(command/defcmd git-stash-apply
   "Apply the top stash without removing it."
   :label "Stash Apply"
   []
@@ -1563,7 +1562,7 @@
         (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Stash apply failed: " (result :stderr)))))
 
-(defcmd git-stash-drop
+(command/defcmd git-stash-drop
   "Drop the top stash."
   :label "Stash Drop"
   []
@@ -1579,7 +1578,7 @@
                (when status-buf (do-status-refresh status-buf)))
            (editor-message (string "Stash drop failed: " (result :stderr))))))}))
 
-(defcmd git-stash-list-cmd
+(command/defcmd git-stash-list-cmd
   "List all stashes."
   :label "List Stashes"
   []
@@ -1609,13 +1608,13 @@
 
 # --- Log transient ---
 
-(defcmd git-log-current
+(command/defcmd git-log-current
   "Show log for current branch."
   :label "Log Current"
   []
   (use-buffer-root) (open-log-buffer))
 
-(defcmd git-log-other
+(command/defcmd git-log-other
   "Show log for another branch."
   :label "Log Other"
   []
@@ -1627,7 +1626,7 @@
      :on-accept (fn [candidate]
                   (open-log-buffer @{:branch (candidate :text)}))}))
 
-(defcmd git-log-file
+(command/defcmd git-log-file
   "Show log for current file."
   :label "Log File"
   []
@@ -1655,19 +1654,19 @@
 
 # --- Diff transient ---
 
-(defcmd git-diff-dwim
+(command/defcmd git-diff-dwim
   "Show diff (unstaged changes)."
   :label "Diff DWIM"
   []
   (use-buffer-root) (open-diff-buffer))
 
-(defcmd git-diff-staged
+(command/defcmd git-diff-staged
   "Show staged diff."
   :label "Diff Staged"
   []
   (use-buffer-root) (open-diff-buffer @{"--cached" true}))
 
-(defcmd git-diff-commit
+(command/defcmd git-diff-commit
   "Show diff for a specific commit."
   :label "Diff Commit"
   []
@@ -1688,7 +1687,7 @@
          (db/pop-to-buffer b (editor/get-state)
                            :actions [:reuse :same])))}))
 
-(defcmd git-diff-range
+(command/defcmd git-diff-range
   "Show diff for a revision range."
   :label "Diff Range"
   []
@@ -1725,42 +1724,42 @@
 
 # --- Git dispatch (top-level transient) ---
 
-(defcmd git-commit-transient
+(command/defcmd git-commit-transient
   "Open commit transient."
   :label "Commit"
   [] (transient/activate :git-commit))
 
-(defcmd git-branch-transient
+(command/defcmd git-branch-transient
   "Open branch transient."
   :label "Branch"
   [] (transient/activate :git-branch))
 
-(defcmd git-push-transient
+(command/defcmd git-push-transient
   "Open push transient."
   :label "Push"
   [] (transient/activate :git-push))
 
-(defcmd git-pull-transient
+(command/defcmd git-pull-transient
   "Open pull transient."
   :label "Pull"
   [] (transient/activate :git-pull))
 
-(defcmd git-fetch-transient
+(command/defcmd git-fetch-transient
   "Open fetch transient."
   :label "Fetch"
   [] (transient/activate :git-fetch))
 
-(defcmd git-log-transient
+(command/defcmd git-log-transient
   "Open log transient."
   :label "Log"
   [] (transient/activate :git-log))
 
-(defcmd git-diff-transient
+(command/defcmd git-diff-transient
   "Open diff transient."
   :label "Diff"
   [] (transient/activate :git-diff))
 
-(defcmd git-stash-transient
+(command/defcmd git-stash-transient
   "Open stash transient."
   :label "Stash"
   [] (transient/activate :git-stash))
@@ -1826,7 +1825,7 @@
   (setdyn :git-root nil)
   (git/repo-root))
 
-(defcmd git-status
+(command/defcmd git-status
   "Open the git status buffer."
   :label "Git Status"
   []
@@ -1844,7 +1843,7 @@
   (db/pop-to-buffer b state :actions [:reuse :same])
   (do-status-refresh b))
 
-(defcmd git-dispatch
+(command/defcmd git-dispatch
   "Open the top-level git transient menu."
   :label "Git Dispatch"
   []
@@ -1859,7 +1858,7 @@
   (set status-buf (get-or-create-status-buffer root))
   (transient/activate :git-dispatch))
 
-(defcmd git-process-buffer
+(command/defcmd git-process-buffer
   "Show the git process log buffer."
   :label "Git Process Buffer"
   []
