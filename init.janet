@@ -10,6 +10,7 @@
 
 (import jax/buffer :as buf)
 (import jax/command)
+(def defcmd :macro (get-in (curenv) ['command/defcmd :value]))
 (import jax/editor :as editor)
 (import jax/hook)
 (import jax/keymap)
@@ -1191,43 +1192,49 @@
 
 # --- Commit transient ---
 
-(command/register :git-commit-create
-  (fn [] (use-buffer-root) (open-commit-buffer))
-  {:doc "Create a new commit." :label "Commit"})
+(defcmd git-commit-create
+  "Create a new commit."
+  :label "Commit"
+  []
+  (use-buffer-root) (open-commit-buffer))
 
-(command/register :git-commit-amend
-  (fn [] (use-buffer-root) (open-commit-buffer true))
-  {:doc "Amend the last commit." :label "Amend"})
+(defcmd git-commit-amend
+  "Amend the last commit."
+  :label "Amend"
+  []
+  (use-buffer-root) (open-commit-buffer true))
 
-(command/register :git-commit-fixup
-  (fn []
-    (use-buffer-root)
-    (prompt/activate
-      {:prompt "Fixup commit: "
-       :on-submit
-       (fn [hash]
-         (def result (git/run "commit" "--fixup" hash))
-         (if (= (result :exit) 0)
-           (do (editor-message "Fixup commit created.")
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Fixup failed: " (result :stderr)))))}))
-  {:doc "Create a fixup commit." :label "Fixup"})
+(defcmd git-commit-fixup
+  "Create a fixup commit."
+  :label "Fixup"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Fixup commit: "
+     :on-submit
+     (fn [hash]
+       (def result (git/run "commit" "--fixup" hash))
+       (if (= (result :exit) 0)
+         (do (editor-message "Fixup commit created.")
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Fixup failed: " (result :stderr)))))}))
 
-(command/register :git-commit-reword
-  (fn []
-    (use-buffer-root)
-    (def root (dyn :git-root))
-    (def result (git/run "log" "-1" "--format=%B"))
-    (when (= (result :exit) 0)
-      (def b (buf/new "*git-commit*"))
-      (set commit-buf b)
-      (put b :major-mode commit-mode)
-      (put-in b [:locals :git-root] root)
-      (buf/insert b 0 (string/trim (result :stdout)))
-      # Override finish to use --amend
-      (db/pop-to-buffer b (editor/get-state)
-                        :actions [:reuse :same])))
-  {:doc "Reword the last commit message." :label "Reword"})
+(defcmd git-commit-reword
+  "Reword the last commit message."
+  :label "Reword"
+  []
+  (use-buffer-root)
+  (def root (dyn :git-root))
+  (def result (git/run "log" "-1" "--format=%B"))
+  (when (= (result :exit) 0)
+    (def b (buf/new "*git-commit*"))
+    (set commit-buf b)
+    (put b :major-mode commit-mode)
+    (put-in b [:locals :git-root] root)
+    (buf/insert b 0 (string/trim (result :stdout)))
+    # Override finish to use --amend
+    (db/pop-to-buffer b (editor/get-state)
+                      :actions [:reuse :same])))
 
 (transient/define :git-commit
   :description "Commit"
@@ -1240,151 +1247,158 @@
       @{:key "-s" :switch "--signoff" :description "Add Signed-off-by"}]}
    @{:name "Create"
      :suffixes
-     [@{:key "c" :command :git-commit-create :description "Commit"}
-      @{:key "a" :command :git-commit-amend :description "Amend"}
-      @{:key "f" :command :git-commit-fixup :description "Fixup"}
-      @{:key "w" :command :git-commit-reword :description "Reword"}]}])
+     [@{:key "c" :command git-commit-create :description "Commit"}
+      @{:key "a" :command git-commit-amend :description "Amend"}
+      @{:key "f" :command git-commit-fixup :description "Fixup"}
+      @{:key "w" :command git-commit-reword :description "Reword"}]}])
 
 # --- Branch transient ---
 
-(command/register :git-branch-checkout
-  (fn []
-    (use-buffer-root)
-    (def branches (git/run-lines "branch" "--format=%(refname:short)"))
-    (prompt/pick
-      {:prompt "Checkout branch: "
-       :candidates (map |(do @{:text $}) branches)
-       :on-accept
-       (fn [candidate]
-         (def result (git/run "checkout" (candidate :text)))
-         (if (= (result :exit) 0)
-           (do (editor-message (string "Switched to " (candidate :text)))
-               (hook/fire :git-post-operation :checkout [(candidate :text)] 0)
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Checkout failed: " (result :stderr)))))}))
-  {:doc "Checkout a branch." :label "Checkout Branch"})
+(defcmd git-branch-checkout
+  "Checkout a branch."
+  :label "Checkout Branch"
+  []
+  (use-buffer-root)
+  (def branches (git/run-lines "branch" "--format=%(refname:short)"))
+  (prompt/pick
+    {:prompt "Checkout branch: "
+     :candidates (map |(do @{:text $}) branches)
+     :on-accept
+     (fn [candidate]
+       (def result (git/run "checkout" (candidate :text)))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Switched to " (candidate :text)))
+             (hook/fire :git-post-operation :checkout [(candidate :text)] 0)
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Checkout failed: " (result :stderr)))))}))
 
-(command/register :git-branch-create-and-checkout
-  (fn []
-    (use-buffer-root)
-    (prompt/activate
-      {:prompt "Create and checkout branch: "
-       :on-submit
-       (fn [name]
-         (def result (git/run "checkout" "-b" name))
-         (if (= (result :exit) 0)
-           (do (editor-message (string "Created and switched to " name))
-               (hook/fire :git-post-operation :checkout [name] 0)
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Failed: " (result :stderr)))))}))
-  {:doc "Create a new branch and check it out." :label "Create & Checkout"})
+(defcmd git-branch-create-and-checkout
+  "Create a new branch and check it out."
+  :label "Create & Checkout"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Create and checkout branch: "
+     :on-submit
+     (fn [name]
+       (def result (git/run "checkout" "-b" name))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Created and switched to " name))
+             (hook/fire :git-post-operation :checkout [name] 0)
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Failed: " (result :stderr)))))}))
 
-(command/register :git-branch-create
-  (fn []
-    (use-buffer-root)
-    (prompt/activate
-      {:prompt "Create branch: "
-       :on-submit
-       (fn [name]
-         (def result (git/run "branch" name))
-         (if (= (result :exit) 0)
-           (editor-message (string "Created branch " name))
-           (editor-message (string "Failed: " (result :stderr)))))}))
-  {:doc "Create a new branch." :label "Create Branch"})
+(defcmd git-branch-create
+  "Create a new branch."
+  :label "Create Branch"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Create branch: "
+     :on-submit
+     (fn [name]
+       (def result (git/run "branch" name))
+       (if (= (result :exit) 0)
+         (editor-message (string "Created branch " name))
+         (editor-message (string "Failed: " (result :stderr)))))}))
 
-(command/register :git-branch-rename
-  (fn []
-    (use-buffer-root)
-    (def branches (git/run-lines "branch" "--format=%(refname:short)"))
-    (prompt/pick
-      {:prompt "Rename branch: "
-       :candidates (map |(do @{:text $}) branches)
-       :on-accept
-       (fn [candidate]
-         (prompt/activate
-           {:prompt (string "Rename " (candidate :text) " to: ")
-            :on-submit
-            (fn [new-name]
-              (def result (git/run "branch" "-m" (candidate :text) new-name))
+(defcmd git-branch-rename
+  "Rename a branch."
+  :label "Rename Branch"
+  []
+  (use-buffer-root)
+  (def branches (git/run-lines "branch" "--format=%(refname:short)"))
+  (prompt/pick
+    {:prompt "Rename branch: "
+     :candidates (map |(do @{:text $}) branches)
+     :on-accept
+     (fn [candidate]
+       (prompt/activate
+         {:prompt (string "Rename " (candidate :text) " to: ")
+          :on-submit
+          (fn [new-name]
+            (def result (git/run "branch" "-m" (candidate :text) new-name))
+            (if (= (result :exit) 0)
+              (do (editor-message (string "Renamed to " new-name))
+                  (when status-buf (do-status-refresh status-buf)))
+              (editor-message (string "Failed: " (result :stderr)))))}))}))
+
+(defcmd git-branch-delete
+  "Delete a branch."
+  :label "Delete Branch"
+  []
+  (use-buffer-root)
+  (def branches (git/run-lines "branch" "--format=%(refname:short)"))
+  (prompt/pick
+    {:prompt "Delete branch: "
+     :candidates (map |(do @{:text $}) branches)
+     :on-accept
+     (fn [candidate]
+       (prompt/activate
+         {:prompt (string "Delete " (candidate :text) "? (y/n) ")
+          :on-submit
+          (fn [input]
+            (when (= (string/ascii-lower (string/trim input)) "y")
+              (def result (git/run "branch" "-d" (candidate :text)))
               (if (= (result :exit) 0)
-                (do (editor-message (string "Renamed to " new-name))
+                (do (editor-message (string "Deleted " (candidate :text)))
                     (when status-buf (do-status-refresh status-buf)))
-                (editor-message (string "Failed: " (result :stderr)))))}))}))
-  {:doc "Rename a branch." :label "Rename Branch"})
-
-(command/register :git-branch-delete
-  (fn []
-    (use-buffer-root)
-    (def branches (git/run-lines "branch" "--format=%(refname:short)"))
-    (prompt/pick
-      {:prompt "Delete branch: "
-       :candidates (map |(do @{:text $}) branches)
-       :on-accept
-       (fn [candidate]
-         (prompt/activate
-           {:prompt (string "Delete " (candidate :text) "? (y/n) ")
-            :on-submit
-            (fn [input]
-              (when (= (string/ascii-lower (string/trim input)) "y")
-                (def result (git/run "branch" "-d" (candidate :text)))
-                (if (= (result :exit) 0)
-                  (do (editor-message (string "Deleted " (candidate :text)))
-                      (when status-buf (do-status-refresh status-buf)))
-                  (editor-message (string "Failed: " (result :stderr)
-                                         " (use -D to force)")))))}))}))
-  {:doc "Delete a branch." :label "Delete Branch"})
+                (editor-message (string "Failed: " (result :stderr)
+                                       " (use -D to force)")))))}))}))
 
 (transient/define :git-branch
   :description "Branch"
   :groups
   [@{:name "Checkout"
      :suffixes
-     [@{:key "b" :command :git-branch-checkout :description "Checkout"}
-      @{:key "c" :command :git-branch-create-and-checkout :description "Create & checkout"}
-      @{:key "n" :command :git-branch-create :description "Create"}]}
+     [@{:key "b" :command git-branch-checkout :description "Checkout"}
+      @{:key "c" :command git-branch-create-and-checkout :description "Create & checkout"}
+      @{:key "n" :command git-branch-create :description "Create"}]}
    @{:name "Do"
      :suffixes
-     [@{:key "r" :command :git-branch-rename :description "Rename"}
-      @{:key "k" :command :git-branch-delete :description "Delete"}]}])
+     [@{:key "r" :command git-branch-rename :description "Rename"}
+      @{:key "k" :command git-branch-delete :description "Delete"}]}])
 
 # --- Push transient ---
 
-(command/register :git-push-pushremote
-  (fn []
-    (use-buffer-root)
-    (def targs (or (dyn :transient-args) @{}))
-    (def args @["push"])
-    (when (targs "--force-with-lease") (array/push args "--force-with-lease"))
-    (when (targs "--set-upstream") (array/push args "--set-upstream"))
-    (when (targs "--dry-run") (array/push args "--dry-run"))
-    (def result (git/run ;args))
-    (if (= (result :exit) 0)
-      (do (editor-message "Pushed successfully.")
-          (hook/fire :git-post-operation :push args 0)
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Push failed: " (result :stderr)))))
-  {:doc "Push to push remote." :label "Push"})
+(defcmd git-push-pushremote
+  "Push to push remote."
+  :label "Push"
+  []
+  (use-buffer-root)
+  (def targs (or (dyn :transient-args) @{}))
+  (def args @["push"])
+  (when (targs "--force-with-lease") (array/push args "--force-with-lease"))
+  (when (targs "--set-upstream") (array/push args "--set-upstream"))
+  (when (targs "--dry-run") (array/push args "--dry-run"))
+  (def result (git/run ;args))
+  (if (= (result :exit) 0)
+    (do (editor-message "Pushed successfully.")
+        (hook/fire :git-post-operation :push args 0)
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Push failed: " (result :stderr)))))
 
-(command/register :git-push-other
-  (fn []
-    (use-buffer-root)
-    (def remotes (git/run-lines "remote"))
-    (prompt/pick
-      {:prompt "Push to remote: "
-       :candidates (map |(do @{:text $}) remotes)
-       :on-accept
-       (fn [candidate]
-         (def targs (or (dyn :transient-args) @{}))
-         (def args @["push" (candidate :text)])
-         (when (targs "--force-with-lease") (array/push args "--force-with-lease"))
-         (when (targs "--set-upstream") (array/push args "--set-upstream"))
-         (def result (git/run ;args))
-         (if (= (result :exit) 0)
-           (do (editor-message (string "Pushed to " (candidate :text)))
-               (hook/fire :git-post-operation :push args 0)
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Push failed: " (result :stderr)))))}))
-  {:doc "Push to another remote." :label "Push to Other"})
+(defcmd git-push-other
+  "Push to another remote."
+  :label "Push to Other"
+  []
+  (use-buffer-root)
+  (def remotes (git/run-lines "remote"))
+  (prompt/pick
+    {:prompt "Push to remote: "
+     :candidates (map |(do @{:text $}) remotes)
+     :on-accept
+     (fn [candidate]
+       (def targs (or (dyn :transient-args) @{}))
+       (def args @["push" (candidate :text)])
+       (when (targs "--force-with-lease") (array/push args "--force-with-lease"))
+       (when (targs "--set-upstream") (array/push args "--set-upstream"))
+       (def result (git/run ;args))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Pushed to " (candidate :text)))
+             (hook/fire :git-post-operation :push args 0)
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Push failed: " (result :stderr)))))}))
 
 (transient/define :git-push
   :description "Push"
@@ -1396,47 +1410,49 @@
       @{:key "-n" :switch "--dry-run" :description "Dry run"}]}
    @{:name "Push to"
      :suffixes
-     [@{:key "p" :command :git-push-pushremote :description "Push to pushremote"}
-      @{:key "o" :command :git-push-other :description "Push to other"}]}])
+     [@{:key "p" :command git-push-pushremote :description "Push to pushremote"}
+      @{:key "o" :command git-push-other :description "Push to other"}]}])
 
 # --- Pull transient ---
 
-(command/register :git-pull-default
-  (fn []
-    (use-buffer-root)
-    (def targs (or (dyn :transient-args) @{}))
-    (def args @["pull"])
-    (when (targs "--rebase") (array/push args "--rebase"))
-    (when (targs "--no-rebase") (array/push args "--no-rebase"))
-    (def result (git/run ;args))
-    (if (= (result :exit) 0)
-      (do (editor-message "Pulled successfully.")
-          (hook/fire :git-post-operation :pull args 0)
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Pull failed: " (result :stderr)))))
-  {:doc "Pull from upstream." :label "Pull"})
+(defcmd git-pull-default
+  "Pull from upstream."
+  :label "Pull"
+  []
+  (use-buffer-root)
+  (def targs (or (dyn :transient-args) @{}))
+  (def args @["pull"])
+  (when (targs "--rebase") (array/push args "--rebase"))
+  (when (targs "--no-rebase") (array/push args "--no-rebase"))
+  (def result (git/run ;args))
+  (if (= (result :exit) 0)
+    (do (editor-message "Pulled successfully.")
+        (hook/fire :git-post-operation :pull args 0)
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Pull failed: " (result :stderr)))))
 
-(command/register :git-pull-other
-  (fn []
-    (use-buffer-root)
-    (def remotes (git/run-lines "remote"))
-    (prompt/pick
-      {:prompt "Pull from remote: "
-       :candidates (map |(do @{:text $}) remotes)
-       :on-accept
-       (fn [candidate]
-         (prompt/activate
-           {:prompt (string "Branch on " (candidate :text) ": ")
-            :on-submit
-            (fn [branch]
-              (def result (git/run "pull" (candidate :text) branch))
-              (if (= (result :exit) 0)
-                (do (editor-message "Pulled successfully.")
-                    (hook/fire :git-post-operation :pull
-                               ["pull" (candidate :text) branch] 0)
-                    (when status-buf (do-status-refresh status-buf)))
-                (editor-message (string "Pull failed: " (result :stderr)))))}))}))
-  {:doc "Pull from another remote." :label "Pull from Other"})
+(defcmd git-pull-other
+  "Pull from another remote."
+  :label "Pull from Other"
+  []
+  (use-buffer-root)
+  (def remotes (git/run-lines "remote"))
+  (prompt/pick
+    {:prompt "Pull from remote: "
+     :candidates (map |(do @{:text $}) remotes)
+     :on-accept
+     (fn [candidate]
+       (prompt/activate
+         {:prompt (string "Branch on " (candidate :text) ": ")
+          :on-submit
+          (fn [branch]
+            (def result (git/run "pull" (candidate :text) branch))
+            (if (= (result :exit) 0)
+              (do (editor-message "Pulled successfully.")
+                  (hook/fire :git-post-operation :pull
+                             ["pull" (candidate :text) branch] 0)
+                  (when status-buf (do-status-refresh status-buf)))
+              (editor-message (string "Pull failed: " (result :stderr)))))}))}))
 
 (transient/define :git-pull
   :description "Pull"
@@ -1447,42 +1463,44 @@
       @{:key "-n" :switch "--no-rebase" :description "No rebase"}]}
    @{:name "Pull from"
      :suffixes
-     [@{:key "p" :command :git-pull-default :description "Pull from upstream"}
-      @{:key "o" :command :git-pull-other :description "Pull from other"}]}])
+     [@{:key "p" :command git-pull-default :description "Pull from upstream"}
+      @{:key "o" :command git-pull-other :description "Pull from other"}]}])
 
 # --- Fetch transient ---
 
-(command/register :git-fetch-default
-  (fn []
-    (use-buffer-root)
-    (def targs (or (dyn :transient-args) @{}))
-    (def args @["fetch"])
-    (when (targs "--prune") (array/push args "--prune"))
-    (when (targs "--all") (array/push args "--all"))
-    (def result (git/run ;args))
-    (if (= (result :exit) 0)
-      (do (editor-message "Fetched successfully.")
-          (hook/fire :git-post-operation :fetch args 0)
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Fetch failed: " (result :stderr)))))
-  {:doc "Fetch from upstream." :label "Fetch"})
+(defcmd git-fetch-default
+  "Fetch from upstream."
+  :label "Fetch"
+  []
+  (use-buffer-root)
+  (def targs (or (dyn :transient-args) @{}))
+  (def args @["fetch"])
+  (when (targs "--prune") (array/push args "--prune"))
+  (when (targs "--all") (array/push args "--all"))
+  (def result (git/run ;args))
+  (if (= (result :exit) 0)
+    (do (editor-message "Fetched successfully.")
+        (hook/fire :git-post-operation :fetch args 0)
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Fetch failed: " (result :stderr)))))
 
-(command/register :git-fetch-other
-  (fn []
-    (use-buffer-root)
-    (def remotes (git/run-lines "remote"))
-    (prompt/pick
-      {:prompt "Fetch from remote: "
-       :candidates (map |(do @{:text $}) remotes)
-       :on-accept
-       (fn [candidate]
-         (def result (git/run "fetch" (candidate :text)))
-         (if (= (result :exit) 0)
-           (do (editor-message (string "Fetched from " (candidate :text)))
-               (hook/fire :git-post-operation :fetch ["fetch" (candidate :text)] 0)
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Fetch failed: " (result :stderr)))))}))
-  {:doc "Fetch from another remote." :label "Fetch from Other"})
+(defcmd git-fetch-other
+  "Fetch from another remote."
+  :label "Fetch from Other"
+  []
+  (use-buffer-root)
+  (def remotes (git/run-lines "remote"))
+  (prompt/pick
+    {:prompt "Fetch from remote: "
+     :candidates (map |(do @{:text $}) remotes)
+     :on-accept
+     (fn [candidate]
+       (def result (git/run "fetch" (candidate :text)))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Fetched from " (candidate :text)))
+             (hook/fire :git-post-operation :fetch ["fetch" (candidate :text)] 0)
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Fetch failed: " (result :stderr)))))}))
 
 (transient/define :git-fetch
   :description "Fetch"
@@ -1493,80 +1511,85 @@
       @{:key "-a" :switch "--all" :description "Fetch all remotes"}]}
    @{:name "Fetch from"
      :suffixes
-     [@{:key "f" :command :git-fetch-default :description "Fetch from upstream"}
-      @{:key "o" :command :git-fetch-other :description "Fetch from other"}]}])
+     [@{:key "f" :command git-fetch-default :description "Fetch from upstream"}
+      @{:key "o" :command git-fetch-other :description "Fetch from other"}]}])
 
 # --- Stash transient ---
 
-(command/register :git-stash-save
-  (fn []
-    (use-buffer-root)
-    (prompt/activate
-      {:prompt "Stash message (optional): "
-       :on-submit
-       (fn [msg]
-         (def targs (or (dyn :transient-args) @{}))
-         (def args @["stash" "push"])
-         (when (targs "--include-untracked") (array/push args "--include-untracked"))
-         (when (targs "--all") (array/push args "--all"))
-         (when (targs "--keep-index") (array/push args "--keep-index"))
-         (when (> (length (string/trim msg)) 0)
-           (array/push args "-m" msg))
-         (def result (git/run ;args))
+(defcmd git-stash-save
+  "Save changes to stash."
+  :label "Stash Save"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Stash message (optional): "
+     :on-submit
+     (fn [msg]
+       (def targs (or (dyn :transient-args) @{}))
+       (def args @["stash" "push"])
+       (when (targs "--include-untracked") (array/push args "--include-untracked"))
+       (when (targs "--all") (array/push args "--all"))
+       (when (targs "--keep-index") (array/push args "--keep-index"))
+       (when (> (length (string/trim msg)) 0)
+         (array/push args "-m" msg))
+       (def result (git/run ;args))
+       (if (= (result :exit) 0)
+         (do (editor-message "Stashed.")
+             (hook/fire :git-post-operation :stash args 0)
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Stash failed: " (result :stderr)))))}))
+
+(defcmd git-stash-pop
+  "Pop the top stash."
+  :label "Stash Pop"
+  []
+  (use-buffer-root)
+  (def result (git/run "stash" "pop"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Stash popped.")
+        (hook/fire :git-post-operation :stash-pop [] 0)
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Stash pop failed: " (result :stderr)))))
+
+(defcmd git-stash-apply
+  "Apply the top stash without removing it."
+  :label "Stash Apply"
+  []
+  (use-buffer-root)
+  (def result (git/run "stash" "apply"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Stash applied.")
+        (hook/fire :git-post-operation :stash-apply [] 0)
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Stash apply failed: " (result :stderr)))))
+
+(defcmd git-stash-drop
+  "Drop the top stash."
+  :label "Stash Drop"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Drop top stash? (y/n) "
+     :on-submit
+     (fn [input]
+       (when (= (string/ascii-lower (string/trim input)) "y")
+         (def result (git/run "stash" "drop"))
          (if (= (result :exit) 0)
-           (do (editor-message "Stashed.")
-               (hook/fire :git-post-operation :stash args 0)
+           (do (editor-message "Stash dropped.")
                (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Stash failed: " (result :stderr)))))}))
-  {:doc "Save changes to stash." :label "Stash Save"})
+           (editor-message (string "Stash drop failed: " (result :stderr))))))}))
 
-(command/register :git-stash-pop
-  (fn []
-    (use-buffer-root)
-    (def result (git/run "stash" "pop"))
-    (if (= (result :exit) 0)
-      (do (editor-message "Stash popped.")
-          (hook/fire :git-post-operation :stash-pop [] 0)
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Stash pop failed: " (result :stderr)))))
-  {:doc "Pop the top stash." :label "Stash Pop"})
-
-(command/register :git-stash-apply
-  (fn []
-    (use-buffer-root)
-    (def result (git/run "stash" "apply"))
-    (if (= (result :exit) 0)
-      (do (editor-message "Stash applied.")
-          (hook/fire :git-post-operation :stash-apply [] 0)
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Stash apply failed: " (result :stderr)))))
-  {:doc "Apply the top stash without removing it." :label "Stash Apply"})
-
-(command/register :git-stash-drop
-  (fn []
-    (use-buffer-root)
-    (prompt/activate
-      {:prompt "Drop top stash? (y/n) "
-       :on-submit
-       (fn [input]
-         (when (= (string/ascii-lower (string/trim input)) "y")
-           (def result (git/run "stash" "drop"))
-           (if (= (result :exit) 0)
-             (do (editor-message "Stash dropped.")
-                 (when status-buf (do-status-refresh status-buf)))
-             (editor-message (string "Stash drop failed: " (result :stderr))))))}))
-  {:doc "Drop the top stash." :label "Stash Drop"})
-
-(command/register :git-stash-list-cmd
-  (fn []
-    (use-buffer-root)
-    (def result (git/run "stash" "list"))
-    (when (= (result :exit) 0)
-      (def b (editor/make-view-buffer "*git-stash-list*" (result :stdout)))
-      (put b :hide-gutter true)
-      (db/pop-to-buffer b (editor/get-state)
-                        :actions [:reuse :split-below])))
-  {:doc "List all stashes." :label "List Stashes"})
+(defcmd git-stash-list-cmd
+  "List all stashes."
+  :label "List Stashes"
+  []
+  (use-buffer-root)
+  (def result (git/run "stash" "list"))
+  (when (= (result :exit) 0)
+    (def b (editor/make-view-buffer "*git-stash-list*" (result :stdout)))
+    (put b :hide-gutter true)
+    (db/pop-to-buffer b (editor/get-state)
+                      :actions [:reuse :split-below])))
 
 (transient/define :git-stash
   :description "Stash"
@@ -1578,36 +1601,40 @@
       @{:key "-k" :switch "--keep-index" :description "Keep index"}]}
    @{:name "Stash"
      :suffixes
-     [@{:key "z" :command :git-stash-save :description "Save"}
-      @{:key "p" :command :git-stash-pop :description "Pop"}
-      @{:key "a" :command :git-stash-apply :description "Apply"}
-      @{:key "d" :command :git-stash-drop :description "Drop"}
-      @{:key "l" :command :git-stash-list-cmd :description "List"}]}])
+     [@{:key "z" :command git-stash-save :description "Save"}
+      @{:key "p" :command git-stash-pop :description "Pop"}
+      @{:key "a" :command git-stash-apply :description "Apply"}
+      @{:key "d" :command git-stash-drop :description "Drop"}
+      @{:key "l" :command git-stash-list-cmd :description "List"}]}])
 
 # --- Log transient ---
 
-(command/register :git-log-current
-  (fn [] (use-buffer-root) (open-log-buffer))
-  {:doc "Show log for current branch." :label "Log Current"})
+(defcmd git-log-current
+  "Show log for current branch."
+  :label "Log Current"
+  []
+  (use-buffer-root) (open-log-buffer))
 
-(command/register :git-log-other
-  (fn []
-    (use-buffer-root)
-    (def branches (git/run-lines "branch" "-a" "--format=%(refname:short)"))
-    (prompt/pick
-      {:prompt "Log for branch: "
-       :candidates (map |(do @{:text $}) branches)
-       :on-accept (fn [candidate]
-                    (open-log-buffer @{:branch (candidate :text)}))}))
-  {:doc "Show log for another branch." :label "Log Other"})
+(defcmd git-log-other
+  "Show log for another branch."
+  :label "Log Other"
+  []
+  (use-buffer-root)
+  (def branches (git/run-lines "branch" "-a" "--format=%(refname:short)"))
+  (prompt/pick
+    {:prompt "Log for branch: "
+     :candidates (map |(do @{:text $}) branches)
+     :on-accept (fn [candidate]
+                  (open-log-buffer @{:branch (candidate :text)}))}))
 
-(command/register :git-log-file
-  (fn []
-    (use-buffer-root)
-    (def b (buffer))
-    (when (b :file)
-      (open-log-buffer @{:file (b :file)})))
-  {:doc "Show log for current file." :label "Log File"})
+(defcmd git-log-file
+  "Show log for current file."
+  :label "Log File"
+  []
+  (use-buffer-root)
+  (def b (buffer))
+  (when (b :file)
+    (open-log-buffer @{:file (b :file)})))
 
 (transient/define :git-log
   :description "Log"
@@ -1622,59 +1649,65 @@
       @{:key "--grep" :option "--grep=" :description "Grep" :reader :string}]}
    @{:name "Log"
      :suffixes
-     [@{:key "l" :command :git-log-current :description "Current"}
-      @{:key "o" :command :git-log-other :description "Other branch"}
-      @{:key "f" :command :git-log-file :description "File"}]}])
+     [@{:key "l" :command git-log-current :description "Current"}
+      @{:key "o" :command git-log-other :description "Other branch"}
+      @{:key "f" :command git-log-file :description "File"}]}])
 
 # --- Diff transient ---
 
-(command/register :git-diff-dwim
-  (fn [] (use-buffer-root) (open-diff-buffer))
-  {:doc "Show diff (unstaged changes)." :label "Diff DWIM"})
+(defcmd git-diff-dwim
+  "Show diff (unstaged changes)."
+  :label "Diff DWIM"
+  []
+  (use-buffer-root) (open-diff-buffer))
 
-(command/register :git-diff-staged
-  (fn [] (use-buffer-root) (open-diff-buffer @{"--cached" true}))
-  {:doc "Show staged diff." :label "Diff Staged"})
+(defcmd git-diff-staged
+  "Show staged diff."
+  :label "Diff Staged"
+  []
+  (use-buffer-root) (open-diff-buffer @{"--cached" true}))
 
-(command/register :git-diff-commit
-  (fn []
-    (use-buffer-root)
-    (prompt/activate
-      {:prompt "Diff commit: "
-       :on-submit
-       (fn [hash]
-         (def result (git/run "diff" hash))
-         (when (= (result :exit) 0)
-           (def b (editor/make-view-buffer
-                    (string "*git-diff " hash "*")
-                    (result :stdout)))
-           (put b :major-mode diff-mode)
-           (put b :hide-gutter true)
-           (put-in b [:locals :git-root] (dyn :git-root))
-           (apply-diff-overlays b)
-           (db/pop-to-buffer b (editor/get-state)
-                             :actions [:reuse :same])))}))
-  {:doc "Show diff for a specific commit." :label "Diff Commit"})
+(defcmd git-diff-commit
+  "Show diff for a specific commit."
+  :label "Diff Commit"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Diff commit: "
+     :on-submit
+     (fn [hash]
+       (def result (git/run "diff" hash))
+       (when (= (result :exit) 0)
+         (def b (editor/make-view-buffer
+                  (string "*git-diff " hash "*")
+                  (result :stdout)))
+         (put b :major-mode diff-mode)
+         (put b :hide-gutter true)
+         (put-in b [:locals :git-root] (dyn :git-root))
+         (apply-diff-overlays b)
+         (db/pop-to-buffer b (editor/get-state)
+                           :actions [:reuse :same])))}))
 
-(command/register :git-diff-range
-  (fn []
-    (use-buffer-root)
-    (prompt/activate
-      {:prompt "Diff range (e.g. main..HEAD): "
-       :on-submit
-       (fn [range]
-         (def result (git/run "diff" range))
-         (when (= (result :exit) 0)
-           (def b (editor/make-view-buffer
-                    (string "*git-diff " range "*")
-                    (result :stdout)))
-           (put b :major-mode diff-mode)
-           (put b :hide-gutter true)
-           (put-in b [:locals :git-root] (dyn :git-root))
-           (apply-diff-overlays b)
-           (db/pop-to-buffer b (editor/get-state)
-                             :actions [:reuse :same])))}))
-  {:doc "Show diff for a revision range." :label "Diff Range"})
+(defcmd git-diff-range
+  "Show diff for a revision range."
+  :label "Diff Range"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Diff range (e.g. main..HEAD): "
+     :on-submit
+     (fn [range]
+       (def result (git/run "diff" range))
+       (when (= (result :exit) 0)
+         (def b (editor/make-view-buffer
+                  (string "*git-diff " range "*")
+                  (result :stdout)))
+         (put b :major-mode diff-mode)
+         (put b :hide-gutter true)
+         (put-in b [:locals :git-root] (dyn :git-root))
+         (apply-diff-overlays b)
+         (db/pop-to-buffer b (editor/get-state)
+                           :actions [:reuse :same])))}))
 
 (transient/define :git-diff
   :description "Diff"
@@ -1685,65 +1718,73 @@
       @{:key "--stat" :switch "--stat" :description "Show stat only"}]}
    @{:name "Diff"
      :suffixes
-     [@{:key "d" :command :git-diff-dwim :description "Dwim (unstaged)"}
-      @{:key "s" :command :git-diff-staged :description "Staged"}
-      @{:key "c" :command :git-diff-commit :description "Commit"}
-      @{:key "r" :command :git-diff-range :description "Range"}]}])
+     [@{:key "d" :command git-diff-dwim :description "Dwim (unstaged)"}
+      @{:key "s" :command git-diff-staged :description "Staged"}
+      @{:key "c" :command git-diff-commit :description "Commit"}
+      @{:key "r" :command git-diff-range :description "Range"}]}])
 
 # --- Git dispatch (top-level transient) ---
 
-(command/register :git-commit-transient
-  (fn [] (transient/activate :git-commit))
-  {:doc "Open commit transient." :label "Commit"})
+(defcmd git-commit-transient
+  "Open commit transient."
+  :label "Commit"
+  [] (transient/activate :git-commit))
 
-(command/register :git-branch-transient
-  (fn [] (transient/activate :git-branch))
-  {:doc "Open branch transient." :label "Branch"})
+(defcmd git-branch-transient
+  "Open branch transient."
+  :label "Branch"
+  [] (transient/activate :git-branch))
 
-(command/register :git-push-transient
-  (fn [] (transient/activate :git-push))
-  {:doc "Open push transient." :label "Push"})
+(defcmd git-push-transient
+  "Open push transient."
+  :label "Push"
+  [] (transient/activate :git-push))
 
-(command/register :git-pull-transient
-  (fn [] (transient/activate :git-pull))
-  {:doc "Open pull transient." :label "Pull"})
+(defcmd git-pull-transient
+  "Open pull transient."
+  :label "Pull"
+  [] (transient/activate :git-pull))
 
-(command/register :git-fetch-transient
-  (fn [] (transient/activate :git-fetch))
-  {:doc "Open fetch transient." :label "Fetch"})
+(defcmd git-fetch-transient
+  "Open fetch transient."
+  :label "Fetch"
+  [] (transient/activate :git-fetch))
 
-(command/register :git-log-transient
-  (fn [] (transient/activate :git-log))
-  {:doc "Open log transient." :label "Log"})
+(defcmd git-log-transient
+  "Open log transient."
+  :label "Log"
+  [] (transient/activate :git-log))
 
-(command/register :git-diff-transient
-  (fn [] (transient/activate :git-diff))
-  {:doc "Open diff transient." :label "Diff"})
+(defcmd git-diff-transient
+  "Open diff transient."
+  :label "Diff"
+  [] (transient/activate :git-diff))
 
-(command/register :git-stash-transient
-  (fn [] (transient/activate :git-stash))
-  {:doc "Open stash transient." :label "Stash"})
+(defcmd git-stash-transient
+  "Open stash transient."
+  :label "Stash"
+  [] (transient/activate :git-stash))
 
 (transient/define :git-dispatch
   :description "Git"
   :groups
   [@{:name "Git"
      :suffixes
-     [@{:key "c" :command :git-commit-transient :description "Commit..."
+     [@{:key "c" :command git-commit-transient :description "Commit..."
         :transient :git-commit}
-      @{:key "b" :command :git-branch-transient :description "Branch..."
+      @{:key "b" :command git-branch-transient :description "Branch..."
         :transient :git-branch}
-      @{:key "P" :command :git-push-transient :description "Push..."
+      @{:key "P" :command git-push-transient :description "Push..."
         :transient :git-push}
-      @{:key "F" :command :git-pull-transient :description "Pull..."
+      @{:key "F" :command git-pull-transient :description "Pull..."
         :transient :git-pull}
-      @{:key "f" :command :git-fetch-transient :description "Fetch..."
+      @{:key "f" :command git-fetch-transient :description "Fetch..."
         :transient :git-fetch}
-      @{:key "l" :command :git-log-transient :description "Log..."
+      @{:key "l" :command git-log-transient :description "Log..."
         :transient :git-log}
-      @{:key "d" :command :git-diff-transient :description "Diff..."
+      @{:key "d" :command git-diff-transient :description "Diff..."
         :transient :git-diff}
-      @{:key "z" :command :git-stash-transient :description "Stash..."
+      @{:key "z" :command git-stash-transient :description "Stash..."
         :transient :git-stash}]}])
 
 # --- Bind transients to status keymap ---
@@ -1785,46 +1826,50 @@
   (setdyn :git-root nil)
   (git/repo-root))
 
-(command/register :git-status
-  (fn []
-    (unless (git/git-available?)
-      (editor-message "git is not installed or not in PATH.")
-      (break))
-    (def root (detect-git-root))
-    (unless root
-      (editor-message "Not in a git repository.")
-      (break))
-    (setdyn :git-root root)
-    (def b (get-or-create-status-buffer root))
-    (set status-buf b)
-    (def state (editor/get-state))
-    (db/pop-to-buffer b state :actions [:reuse :same])
-    (do-status-refresh b))
-  {:doc "Open the git status buffer." :label "Git Status"})
+(defcmd git-status
+  "Open the git status buffer."
+  :label "Git Status"
+  []
+  (unless (git/git-available?)
+    (editor-message "git is not installed or not in PATH.")
+    (break))
+  (def root (detect-git-root))
+  (unless root
+    (editor-message "Not in a git repository.")
+    (break))
+  (setdyn :git-root root)
+  (def b (get-or-create-status-buffer root))
+  (set status-buf b)
+  (def state (editor/get-state))
+  (db/pop-to-buffer b state :actions [:reuse :same])
+  (do-status-refresh b))
 
-(command/register :git-dispatch
-  (fn []
-    (unless (git/git-available?)
-      (editor-message "git is not installed or not in PATH.")
-      (break))
-    (def root (detect-git-root))
-    (unless root
-      (editor-message "Not in a git repository.")
-      (break))
-    (setdyn :git-root root)
-    (set status-buf (get-or-create-status-buffer root))
-    (transient/activate :git-dispatch))
-  {:doc "Open the top-level git transient menu." :label "Git Dispatch"})
+(defcmd git-dispatch
+  "Open the top-level git transient menu."
+  :label "Git Dispatch"
+  []
+  (unless (git/git-available?)
+    (editor-message "git is not installed or not in PATH.")
+    (break))
+  (def root (detect-git-root))
+  (unless root
+    (editor-message "Not in a git repository.")
+    (break))
+  (setdyn :git-root root)
+  (set status-buf (get-or-create-status-buffer root))
+  (transient/activate :git-dispatch))
 
-(command/register :git-process-buffer
-  (fn [] (show-process-buffer))
-  {:doc "Show the git process log buffer." :label "Git Process Buffer"})
+(defcmd git-process-buffer
+  "Show the git process log buffer."
+  :label "Git Process Buffer"
+  []
+  (show-process-buffer))
 
 # --- Global keybindings ---
 
 (def global-km (editor/global-keymap))
-(keymap/bind global-km "C-x g" :git-status)
-(keymap/bind global-km "C-x G" :git-dispatch)
+(keymap/bind global-km "C-x g" git-status)
+(keymap/bind global-km "C-x G" git-dispatch)
 
 # --- Debounced refresh on save ---
 
