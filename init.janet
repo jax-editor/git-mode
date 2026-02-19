@@ -860,6 +860,8 @@
         (put b :readonly true)
         (put b :hide-gutter true)
         (put-in b [:locals :git-root] root)
+        (put-in b [:locals :project-root] root)
+        (put-in b [:locals :default-directory] root)
         (put status-bufs root b)
         b)))
 
@@ -923,6 +925,8 @@
   (set commit-buf b)
   (put b :major-mode commit-mode)
   (put-in b [:locals :git-root] root)
+  (put-in b [:locals :project-root] root)
+  (put-in b [:locals :default-directory] root)
 
   # Pre-populate with amend message if amending
   (when amend
@@ -1033,6 +1037,8 @@
     (put b :major-mode diff-mode)
     (put b :hide-gutter true)
     (put-in b [:locals :git-root] root)
+    (put-in b [:locals :project-root] root)
+    (put-in b [:locals :default-directory] root)
     (db/pop-to-buffer b (editor/get-state)
                       :actions [:reuse :split-below])
     (apply-diff-overlays b))))
@@ -1095,6 +1101,8 @@
   (put b :major-mode log-mode)
   (put b :hide-gutter true)
   (put-in b [:locals :git-root] (dyn :git-root))
+  (put-in b [:locals :project-root] (dyn :git-root))
+  (put-in b [:locals :default-directory] (dyn :git-root))
 
   # Insert raw git log output — PEG grammar handles highlighting
   (put b :readonly false)
@@ -1162,6 +1170,8 @@
   (put b :major-mode diff-mode)
   (put b :hide-gutter true)
   (put-in b [:locals :git-root] (dyn :git-root))
+  (put-in b [:locals :project-root] (dyn :git-root))
+  (put-in b [:locals :default-directory] (dyn :git-root))
   (apply-diff-overlays b)
   (db/pop-to-buffer b (editor/get-state)
                     :actions [:reuse :same]))
@@ -1230,6 +1240,8 @@
     (set commit-buf b)
     (put b :major-mode commit-mode)
     (put-in b [:locals :git-root] root)
+    (put-in b [:locals :project-root] root)
+    (put-in b [:locals :default-directory] root)
     (buf/insert b 0 (string/trim (result :stdout)))
     # Override finish to use --amend
     (db/pop-to-buffer b (editor/get-state)
@@ -1587,6 +1599,8 @@
   (when (= (result :exit) 0)
     (def b (editor/make-view-buffer "*git-stash-list*" (result :stdout)))
     (put b :hide-gutter true)
+    (put-in b [:locals :project-root] (dyn :git-root))
+    (put-in b [:locals :default-directory] (dyn :git-root))
     (db/pop-to-buffer b (editor/get-state)
                       :actions [:reuse :split-below])))
 
@@ -1683,6 +1697,8 @@
          (put b :major-mode diff-mode)
          (put b :hide-gutter true)
          (put-in b [:locals :git-root] (dyn :git-root))
+         (put-in b [:locals :project-root] (dyn :git-root))
+         (put-in b [:locals :default-directory] (dyn :git-root))
          (apply-diff-overlays b)
          (db/pop-to-buffer b (editor/get-state)
                            :actions [:reuse :same])))}))
@@ -1704,6 +1720,8 @@
          (put b :major-mode diff-mode)
          (put b :hide-gutter true)
          (put-in b [:locals :git-root] (dyn :git-root))
+         (put-in b [:locals :project-root] (dyn :git-root))
+         (put-in b [:locals :default-directory] (dyn :git-root))
          (apply-diff-overlays b)
          (db/pop-to-buffer b (editor/get-state)
                            :actions [:reuse :same])))}))
