@@ -166,7 +166,11 @@
 (keymap/bind status-keymap "tab" (fn [] (do-toggle-section)))
 
 # Operations
-(keymap/bind status-keymap "g" (fn [] (do-refresh)))
+(def g-map (keymap/new))
+(keymap/bind g-map "r" (fn [] (do-refresh)))
+(keymap/bind g-map "g" (fn [] (move/beginning-of-buffer)))
+(keymap/bind status-keymap "g" g-map)
+(keymap/bind status-keymap "G" (fn [] (move/end-of-buffer)))
 (keymap/bind status-keymap "s" (fn [] (do-stage)))
 (keymap/bind status-keymap "u" (fn [] (do-unstage)))
 (keymap/bind status-keymap "x" (fn [] (do-discard)))
@@ -317,6 +321,8 @@
   (def stash-data (results :stash))
   (def diff-unstaged (results :diff-unstaged))
   (def diff-staged (results :diff-staged))
+  (def unpushed-data (or (results :unpushed) @[]))
+  (def unpulled-data (or (results :unpulled) @[]))
 
   # Read view state from buffer locals
   (def expanded-files (or (get-in b [:locals :expanded-files]) @{}))
@@ -471,32 +477,44 @@
   (render-section :staged "Staged changes" staged
                   :git-staged diff-staged)
 
+  # Helper to render a commit list section
+  (defn render-commit-section [section-key heading commits]
+    (when (> (length commits) 0)
+      (def section-start (length lines))
+      (add-line (string heading " (" (length commits) ")")
+                :git-section-heading)
+      (def children @[])
+      (unless (collapsed-sections section-key)
+        (each commit commits
+          (def refs-str (if (commit :refs) (string " (" (commit :refs) ")") ""))
+          (def commit-line
+            (add-line (string "  " (commit :hash) " "
+                             (commit :date) "  "
+                             (commit :subject) refs-str)
+                      :git-hash))
+          (array/push children
+            (sec/make-section :commit commit-line commit-line
+                              :data commit
+                              :face :git-hash))))
+      (def section-end (- (length lines) 1))
+      (array/push sections
+        (sec/make-section :section-header section-start section-end
+                          :data @{:status section-key}
+                          :children children
+                          :collapsed (truthy? (collapsed-sections section-key))
+                          :face :git-section-heading))
+      (add-line "")))
+
+  # --- Unpushed / Unpulled commits ---
+  (render-commit-section :unpushed
+    (string "Unpushed to " (or (branch :upstream) "upstream"))
+    unpushed-data)
+  (render-commit-section :unpulled
+    (string "Unpulled from " (or (branch :upstream) "upstream"))
+    unpulled-data)
+
   # --- Recent commits ---
-  (when (and log-data (> (length log-data) 0))
-    (def section-start (length lines))
-    (add-line (string "Recent commits (" (length log-data) ")")
-              :git-section-heading)
-    (def children @[])
-    (unless (collapsed-sections :log)
-      (each commit log-data
-        (def refs-str (if (commit :refs) (string " (" (commit :refs) ")") ""))
-        (def commit-line
-          (add-line (string "  " (commit :hash) " "
-                           (commit :date) "  "
-                           (commit :subject) refs-str)
-                    :git-hash))
-        (array/push children
-          (sec/make-section :commit commit-line commit-line
-                            :data commit
-                            :face :git-hash))))
-    (def section-end (- (length lines) 1))
-    (array/push sections
-      (sec/make-section :section-header section-start section-end
-                        :data @{:status :log}
-                        :children children
-                        :collapsed (truthy? (collapsed-sections :log))
-                        :face :git-section-heading))
-    (add-line ""))
+  (render-commit-section :log "Recent commits" log-data)
 
   # --- Stashes ---
   (when (and stash-data (> (length stash-data) 0))
@@ -590,20 +608,32 @@
   # Fire concurrent git commands
   (def results @{})
   (def ch (ev/chan))
+  (def log-fmt (string "--format=%h%x00%s%x00%ar%x00%an%x00%D"))
 
-  (each [key & args]
-    [[:status "status" "--porcelain=v2" "--branch"]
-     [:diff-unstaged-raw "diff"]
-     [:diff-staged-raw "diff" "--cached"]
-     [:log-raw "log" (string "--format=%h%x00%s%x00%ar%x00%an%x00%D")
-      (string "-" (string log-max-count))]
-     [:stash-raw "stash" "list"]]
+  # Detect upstream for unpushed/unpulled
+  (def upstream (git/upstream-ref))
+
+  (def commands
+    @[[:status "status" "--porcelain=v2" "--branch"]
+      [:diff-unstaged-raw "diff"]
+      [:diff-staged-raw "diff" "--cached"]
+      [:log-raw "log" log-fmt (string "-" (string log-max-count))]
+      [:stash-raw "stash" "list"]])
+
+  (when upstream
+    (array/push commands
+      [:unpushed-raw "log" log-fmt (string upstream "..HEAD")])
+    (array/push commands
+      [:unpulled-raw "log" log-fmt (string "HEAD.." upstream)]))
+
+  (def num-commands (length commands))
+  (each [key & args] commands
     (ev/go (fn []
              (def result (git/run ;args))
              (ev/give ch [key result]))))
 
   # Collect results
-  (repeat 5
+  (repeat num-commands
     (def [key result] (ev/take ch))
     (put results key result))
 
@@ -619,6 +649,14 @@
        (git/parse-log (get-in results [:log-raw :stdout] "")))
   (put parsed :stash
        (git/parse-stash-list (get-in results [:stash-raw :stdout] "")))
+  (put parsed :unpushed
+       (if upstream
+         (git/parse-log (get-in results [:unpushed-raw :stdout] ""))
+         @[]))
+  (put parsed :unpulled
+       (if upstream
+         (git/parse-log (get-in results [:unpulled-raw :stdout] ""))
+         @[]))
 
   # Render
   (render-status-buffer b parsed)
@@ -1039,7 +1077,8 @@
   # Get transient args for commit flags
   (def args @["commit" "-m" msg])
   (def targs (or (dyn :transient-args) @{}))
-  (when (targs "--amend") (array/push args "--amend"))
+  (when (or (targs "--amend") (get-in b [:locals :amend]))
+    (array/push args "--amend"))
   (when (targs "--all") (array/push args "--all"))
   (when (targs "--no-verify") (array/push args "--no-verify"))
   (when (targs "--signoff") (array/push args "--signoff"))
@@ -1049,15 +1088,17 @@
   (if (= (result :exit) 0)
     (do
       (editor-message "Committed.")
+      (set commit-buf nil)
+      (quit-git-buffer)
       (hook/fire :git-commit-finished msg)
       (hook/fire :git-post-operation :commit args 0)
-      # Kill commit buffer and refresh status
       (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Commit failed: " (result :stderr)))))
 
 (defn- cancel-commit []
   (editor-message "Commit cancelled.")
-  (set commit-buf nil))
+  (set commit-buf nil)
+  (quit-git-buffer))
 
 (keymap/bind commit-keymap "C-c C-c" finish-commit)
 (keymap/bind commit-keymap "C-c C-k" cancel-commit)
@@ -1073,6 +1114,7 @@
 
   # Pre-populate with amend message if amending
   (when amend
+    (put-in b [:locals :amend] true)
     (def result (git/run "log" "-1" "--format=%B"))
     (when (= (result :exit) 0)
       (buf/insert b 0 (string/trim (result :stdout)))))
