@@ -119,6 +119,87 @@
   []
   (truthy? (repo-root)))
 
+# --- Branch / remote helpers ---
+
+(defn current-branch
+  "Return the current branch name, or nil if detached HEAD."
+  []
+  (try
+    (do
+      (def p (os/spawn (git-cmd ["symbolic-ref" "--short" "HEAD"]) :p
+                       {:out :pipe :err :pipe}))
+      (def out (string/trim (or (:read (p :out) :all) "")))
+      (:read (p :err) :all)
+      (if (= (:wait p) 0) out nil))
+    ([_] nil)))
+
+(defn upstream-ref
+  "Return the upstream tracking ref for a branch (e.g. 'origin/master'),
+  or nil if none configured. Defaults to current branch."
+  [&opt branch]
+  (def br (or branch (current-branch)))
+  (unless br (break nil))
+  (try
+    (do
+      (def p (os/spawn (git-cmd ["config" "--get"
+                                 (string "branch." br ".remote")]) :p
+                       {:out :pipe :err :pipe}))
+      (def remote (string/trim (or (:read (p :out) :all) "")))
+      (:read (p :err) :all)
+      (unless (= (:wait p) 0) (break nil))
+      (def p2 (os/spawn (git-cmd ["config" "--get"
+                                  (string "branch." br ".merge")]) :p
+                        {:out :pipe :err :pipe}))
+      (def merge-ref (string/trim (or (:read (p2 :out) :all) "")))
+      (:read (p2 :err) :all)
+      (unless (= (:wait p2) 0) (break nil))
+      # Convert refs/heads/main -> main
+      (def short-ref
+        (if (string/has-prefix? "refs/heads/" merge-ref)
+          (string/slice merge-ref 11)
+          merge-ref))
+      (string remote "/" short-ref))
+    ([_] nil)))
+
+(defn push-remote-ref
+  "Return the push remote ref for a branch, or nil.
+  Checks pushRemote config, falls back to upstream remote.
+  Defaults to current branch."
+  [&opt branch]
+  (def br (or branch (current-branch)))
+  (unless br (break nil))
+  (try
+    (do
+      # Check branch.<name>.pushRemote first
+      (def p (os/spawn (git-cmd ["config" "--get"
+                                 (string "branch." br ".pushRemote")]) :p
+                       {:out :pipe :err :pipe}))
+      (def push-remote (string/trim (or (:read (p :out) :all) "")))
+      (:read (p :err) :all)
+      (def remote
+        (if (and (= (:wait p) 0) (> (length push-remote) 0))
+          push-remote
+          # Fall back to remote.pushDefault
+          (do
+            (def p2 (os/spawn (git-cmd ["config" "--get"
+                                        "remote.pushDefault"]) :p
+                              {:out :pipe :err :pipe}))
+            (def pd (string/trim (or (:read (p2 :out) :all) "")))
+            (:read (p2 :err) :all)
+            (if (and (= (:wait p2) 0) (> (length pd) 0))
+              pd
+              # Fall back to upstream remote
+              (do
+                (def p3 (os/spawn (git-cmd ["config" "--get"
+                                            (string "branch." br ".remote")]) :p
+                                  {:out :pipe :err :pipe}))
+                (def r (string/trim (or (:read (p3 :out) :all) "")))
+                (:read (p3 :err) :all)
+                (when (= (:wait p3) 0) r))))))
+      (when (and remote (> (length remote) 0))
+        (string remote "/" br)))
+    ([_] nil)))
+
 (defn run
   "Run a git command, log to the process buffer, return
   {:exit exit-code :stdout string :stderr string :elapsed seconds}.

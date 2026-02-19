@@ -21,6 +21,8 @@
 (import jax/transient)
 (import jax/display-buffer :as db)
 (import jax/core :prefix "")
+(import jax/commands/movement :as move)
+(import jax/undo :as undo)
 
 (import ./plumbing :as git)
 (import ./sections :as sec)
@@ -171,21 +173,98 @@
 (keymap/bind status-keymap "enter" (fn [] (do-visit)))
 (keymap/bind status-keymap "q" (fn [] (quit-git-buffer)))
 
-# Line selection for region staging
-(keymap/bind status-keymap "v"
-  (fn []
-    (def p (pane))
-    (if (p :mark)
-      (do (put p :mark nil)
-          (put p :selection-type nil))
-      (do (put p :mark (cursor))
-          (put p :selection-type :line)))))
+# --- Cursor helpers (needed early by line selection and navigation) ---
+
+(defn- cursor-line []
+  (def b (buffer))
+  (- (first (buf/line-col b (cursor))) 1))
+
+(defn- goto-line [b line]
+  (when line
+    (def pos (buf/line-byte-offset b line))
+    (when pos (set-cursor pos))))
+
+# --- Line selection for region staging ---
+# Native line-selection using buffer locals and overlays.
+# Tracks selected line range in [:locals :line-select] as
+# @{:anchor <line> :end <line>} and highlights with overlays.
+
+(defn- line-select-state [b]
+  (get-in b [:locals :line-select]))
+
+(defn- line-select-range [b]
+  "Return [first-line last-line] of the current selection, or nil."
+  (when-let [sel (line-select-state b)]
+    [(min (sel :anchor) (sel :end))
+     (max (sel :anchor) (sel :end))]))
+
+(defn- line-select-update-overlays [b]
+  "Update selection highlight overlays to match current selection range."
+  (overlay/clear-overlays-by-tag b :git-line-select)
+  (when-let [[first-line last-line] (line-select-range b)]
+    (for i first-line (+ last-line 1)
+      (def start (buf/line-byte-offset b i))
+      (def end (buf/line-end-byte-offset b i))
+      (when (and start end)
+        (overlay/add-overlay b
+          (overlay/make-overlay b start end :selection
+            {:tag :git-line-select :priority 20}))))))
+
+(defn- line-select-start [b line]
+  "Enter line-selection mode at the given line."
+  (put-in b [:locals :line-select] @{:anchor line :end line})
+  (line-select-update-overlays b))
+
+(defn- line-select-extend [b line]
+  "Extend the selection to the given line."
+  (when-let [sel (line-select-state b)]
+    (put sel :end line)
+    (line-select-update-overlays b)))
+
+(defn- line-select-clear [b]
+  "Cancel line selection."
+  (put-in b [:locals :line-select] nil)
+  (overlay/clear-overlays-by-tag b :git-line-select))
+
+(defn- line-select-move [delta]
+  "Move selection end by delta lines (+1 or -1) and move cursor."
+  (def b (buffer))
+  (def sel (line-select-state b))
+  (unless sel (break))
+  (def new-end (+ (sel :end) delta))
+  (when (and (>= new-end 0) (< new-end (buf/line-count b)))
+    (put sel :end new-end)
+    (line-select-update-overlays b)
+    (when-let [pos (buf/line-byte-offset b new-end)]
+      (set-cursor pos))))
+
+(defn- toggle-line-select []
+  (def b (buffer))
+  (if (line-select-state b)
+    (line-select-clear b)
+    (line-select-start b (cursor-line))))
+
+(keymap/bind status-keymap "v" toggle-line-select)
+(keymap/bind status-keymap "V" toggle-line-select)
 
 (keymap/bind status-keymap "escape"
+  (fn [] (line-select-clear (buffer))))
+
+(keymap/bind status-keymap "C-g"
+  (fn [] (line-select-clear (buffer))))
+
+# j/k — line movement, selection-aware
+(keymap/bind status-keymap "j"
   (fn []
-    (def p (pane))
-    (put p :mark nil)
-    (put p :selection-type nil)))
+    (if (line-select-state (buffer))
+      (line-select-move 1)
+      (move/next-line 1))))
+
+(keymap/bind status-keymap "k"
+  (fn []
+    (if (line-select-state (buffer))
+      (line-select-move -1)
+      (move/prev-line 1))))
 
 # Transients — bound after transient definitions below
 (keymap/bind status-keymap "$"
@@ -248,6 +327,7 @@
 
   # Clear buffer
   (put b :readonly false)
+  (unless (b :undo-root) (undo/init b))
   (when (> (buf/length b) 0)
     (buf/delete-forward b 0 (buf/length b)))
 
@@ -547,15 +627,6 @@
 
 # --- Section navigation commands ---
 
-(defn- cursor-line []
-  (def b (buffer))
-  (- (first (buf/line-col b (cursor))) 1))
-
-(defn- goto-line [b line]
-  (when line
-    (def pos (buf/line-byte-offset b line))
-    (when pos (set-cursor pos))))
-
 (set do-next-section
   (fn []
     (def b (buffer))
@@ -649,23 +720,18 @@
 # --- Staging operations ---
 
 (defn- hunk-region-lines
-  "If the pane has an active mark within the current hunk section,
+  "If the buffer has an active line selection within the current hunk section,
   return [sel-start sel-end] as 0-indexed offsets into hunk :lines.
   Otherwise return nil (meaning stage the whole hunk)."
   [b section]
-  (def p (pane))
-  (def mark (p :mark))
-  (unless mark (break nil))
-  (def cur (p :cursor))
+  (def sel-range (line-select-range b))
+  (unless sel-range (break nil))
+  (def [sel-first sel-last] sel-range)
   (def hunk-data (get-in section [:data :hunk]))
   (unless hunk-data (break nil))
   # The hunk section spans lines section:start to section:end.
   # Line section:start is the hunk header, actual diff lines start at +1.
   (def first-content-line (+ (section :start) 1))
-  (def mark-line (- (first (buf/line-col b mark)) 1))
-  (def cur-line (- (first (buf/line-col b cur)) 1))
-  (def sel-first (min mark-line cur-line))
-  (def sel-last (max mark-line cur-line))
   # Convert to hunk-relative offsets (0-indexed into hunk :lines)
   (def rel-start (- sel-first first-content-line))
   (def rel-end (- sel-last first-content-line))
@@ -737,8 +803,7 @@
         nil))
 
     # Clear selection after staging
-    (put (pane) :mark nil)
-    (put (pane) :selection-type nil)
+    (line-select-clear b)
     (do-status-refresh b)
     (hook/fire :git-post-operation :stage [] 0)))
 
@@ -775,8 +840,7 @@
         (each child (section :children)
           (git/run "restore" "--staged" (get-in child [:data :path])))))
 
-    (put (pane) :mark nil)
-    (put (pane) :selection-type nil)
+    (line-select-clear b)
     (do-status-refresh b)
     (hook/fire :git-post-operation :unstage [] 0)))
 
@@ -817,12 +881,87 @@
              (each child (section :children)
                (discard-file (get-in child [:data :path])
                              (get-in child [:data :status]))))
-           (put (pane) :mark nil)
-           (put (pane) :selection-type nil)
+           (line-select-clear b)
            (do-status-refresh b)
            (hook/fire :git-post-operation :discard [] 0)))})))
 
 # --- Visit thing at point ---
+
+(defn- visit-hunk-line
+  "Visit the file at the diff line under the cursor within a hunk section.
+  Context and added lines open the working copy at the corresponding line.
+  Removed lines open a temporary buffer with the old file version."
+  [b line section]
+  (def root (get-in b [:locals :git-root]))
+  (unless root (break))
+  (use-buffer-root)
+
+  (def hunk (get-in section [:data :hunk]))
+  (def file-diff (get-in section [:data :file-diff]))
+  (unless (and hunk file-diff) (break))
+
+  # Determine which hunk line the cursor is on
+  (def hunk-content-start (+ (section :start) 1))
+  (def line-idx (- line hunk-content-start))
+  (def hunk-lines (hunk :lines))
+  (when (or (< line-idx 0) (>= line-idx (length hunk-lines)))
+    # Cursor is on the hunk header — visit the file at hunk start
+    (when-let [file-path (file-diff :file)]
+      (def full-path (string root "/" file-path))
+      (def target-line (- (hunk :new-start) 1))
+      (def opened (editor/open-file full-path (editor/get-state)))
+      (when (and opened (> target-line 0))
+        (when-let [pos (buf/line-byte-offset opened target-line)]
+          (set-cursor pos))))
+    (break))
+
+  (def diff-line (get hunk-lines line-idx))
+  (def prefix (string/slice diff-line 0 1))
+
+  # Walk hunk lines up to line-idx to compute file line numbers
+  (var old-line (hunk :old-start))
+  (var new-line (hunk :new-start))
+  (for i 0 line-idx
+    (def l (get hunk-lines i))
+    (def p (string/slice l 0 1))
+    (cond
+      (= p " ") (do (++ old-line) (++ new-line))
+      (= p "+") (++ new-line)
+      (= p "-") (++ old-line)))
+
+  (def file-path (file-diff :file))
+  (def old-file-path (or (file-diff :old-file) file-path))
+
+  (cond
+    # Removed line — show old version from git
+    (= prefix "-")
+    (let [file-status (file-status-for-hunk section)
+          # Unstaged diffs compare index vs worktree — old version is index.
+          # Staged diffs compare HEAD vs index — old version is HEAD.
+          ref-path (if (= file-status :staged)
+                     (string "HEAD:" old-file-path)
+                     (string ":" old-file-path))
+          ref-label (if (= file-status :staged) "HEAD" "index")
+          result (git/run "show" ref-path)]
+      (when (= (result :exit) 0)
+        (def buf-name (string "*" old-file-path " (" ref-label ")*"))
+        (def view-buf (editor/make-view-buffer buf-name (result :stdout)))
+        (put-in view-buf [:locals :git-root] root)
+        (db/pop-to-buffer view-buf (editor/get-state)
+                          :actions [:reuse :split-below])
+        # Jump to the target line (0-indexed)
+        (def target-line (- old-line 1))
+        (when (> target-line 0)
+          (when-let [pos (buf/line-byte-offset view-buf target-line)]
+            (set-cursor pos)))))
+
+    # Context or added line — open working copy
+    (let [full-path (string root "/" file-path)
+          target-line (- new-line 1)]
+      (def opened (editor/open-file full-path (editor/get-state)))
+      (when (and opened (> target-line 0))
+        (when-let [pos (buf/line-byte-offset opened target-line)]
+          (set-cursor pos))))))
 
 (set do-visit
   (fn []
@@ -837,6 +976,9 @@
             root (get-in b [:locals :git-root])]
         (when (and path root)
           (editor/open-file (string root "/" path) (editor/get-state))))
+
+      :hunk
+      (visit-hunk-line b line section)
 
       :commit
       (let [hash (get-in section [:data :hash])]
@@ -859,6 +1001,7 @@
         (put b :major-mode status-mode)
         (put b :readonly true)
         (put b :hide-gutter true)
+        (undo/init b)
         (put-in b [:locals :git-root] root)
         (put-in b [:locals :project-root] root)
         (put-in b [:locals :default-directory] root)
@@ -1213,20 +1356,16 @@
   []
   (use-buffer-root) (open-commit-buffer true))
 
-(command/defcmd git-commit-fixup
-  "Create a fixup commit."
-  :label "Fixup"
+(command/defcmd git-commit-extend
+  "Extend the last commit with staged changes (no message edit)."
+  :label "Extend"
   []
   (use-buffer-root)
-  (prompt/activate
-    {:prompt "Fixup commit: "
-     :on-submit
-     (fn [hash]
-       (def result (git/run "commit" "--fixup" hash))
-       (if (= (result :exit) 0)
-         (do (editor-message "Fixup commit created.")
-             (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Fixup failed: " (result :stderr)))))}))
+  (def result (git/run "commit" "--amend" "--no-edit"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Commit extended.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Extend failed: " (result :stderr)))))
 
 (command/defcmd git-commit-reword
   "Reword the last commit message."
@@ -1242,10 +1381,60 @@
     (put-in b [:locals :git-root] root)
     (put-in b [:locals :project-root] root)
     (put-in b [:locals :default-directory] root)
+    (put-in b [:locals :amend] true)
     (buf/insert b 0 (string/trim (result :stdout)))
-    # Override finish to use --amend
     (db/pop-to-buffer b (editor/get-state)
                       :actions [:reuse :same])))
+
+(command/defcmd git-commit-fixup
+  "Create a fixup commit for a given commit."
+  :label "Fixup"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Fixup commit: "
+     :on-submit
+     (fn [hash]
+       (def result (git/run "commit" "--fixup" hash))
+       (if (= (result :exit) 0)
+         (do (editor-message "Fixup commit created.")
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Fixup failed: " (result :stderr)))))}))
+
+(command/defcmd git-commit-instant-fixup
+  "Create a fixup commit and immediately rebase."
+  :label "Instant Fixup"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Instant fixup commit: "
+     :on-submit
+     (fn [hash]
+       (def root (dyn :git-root))
+       (def result (git/run "commit" "--fixup" hash))
+       (when (= (result :exit) 0)
+         (ev/spawn
+           (setdyn :git-root root)
+           (def rb (git/run "rebase" "-i" "--autosquash" (string hash "~1")))
+           (if (= (rb :exit) 0)
+             (do (editor-message "Fixup applied.")
+                 (when status-buf (do-status-refresh status-buf)))
+             (editor-message (string "Rebase failed: " (rb :stderr)))))))}))
+
+(command/defcmd git-commit-squash
+  "Create a squash commit for a given commit."
+  :label "Squash"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Squash commit: "
+     :on-submit
+     (fn [hash]
+       (def result (git/run "commit" "--squash" hash))
+       (if (= (result :exit) 0)
+         (do (editor-message "Squash commit created.")
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Squash failed: " (result :stderr)))))}))
 
 (transient/define :git-commit
   :description "Commit"
@@ -1253,15 +1442,20 @@
   [@{:name "Arguments"
      :infixes
      [@{:key "-a" :switch "--all" :description "Stage all modified"}
-      @{:key "-e" :switch "--allow-empty" :description "Allow empty commit"}
+      @{:key "-e" :switch "--allow-empty" :description "Allow empty commit" :level 5}
+      @{:key "-v" :switch "--verbose" :description "Show diff in message buffer" :level 5}
       @{:key "-n" :switch "--no-verify" :description "Skip hooks"}
-      @{:key "-s" :switch "--signoff" :description "Add Signed-off-by"}]}
+      @{:key "-s" :switch "--signoff" :description "Add Signed-off-by" :level 5}
+      @{:key "-R" :switch "--reset-author" :description "Reset author" :level 5}]}
    @{:name "Create"
      :suffixes
      [@{:key "c" :command git-commit-create :description "Commit"}
+      @{:key "e" :command git-commit-extend :description "Extend"}
+      @{:key "w" :command git-commit-reword :description "Reword"}
       @{:key "a" :command git-commit-amend :description "Amend"}
       @{:key "f" :command git-commit-fixup :description "Fixup"}
-      @{:key "w" :command git-commit-reword :description "Reword"}]}])
+      @{:key "F" :command git-commit-instant-fixup :description "Instant fixup" :level 5}
+      @{:key "s" :command git-commit-squash :description "Squash" :level 5}]}])
 
 # --- Branch transient ---
 
@@ -1357,6 +1551,52 @@
                 (editor-message (string "Failed: " (result :stderr)
                                        " (use -D to force)")))))}))}))
 
+(command/defcmd git-branch-spinoff
+  "Create a new branch from the current branch and reset current."
+  :label "Spinoff"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Spinoff branch name: "
+     :on-submit
+     (fn [name]
+       (def branch (git/current-branch))
+       (unless branch
+         (editor-message "Cannot spinoff: not on a branch.")
+         (break))
+       (def upstream (git/upstream-ref))
+       (def result (git/run "checkout" "-b" name))
+       (when (= (result :exit) 0)
+         (when upstream
+           (def parts (string/split "/" upstream))
+           (when (>= (length parts) 2)
+             (def remote (first parts))
+             (def remote-branch (string/join (slice parts 1) "/"))
+             (git/run "branch" "--force" branch (string remote "/" remote-branch))))
+         (editor-message (string "Spun off " name " from " branch))
+         (when status-buf (do-status-refresh status-buf))))}))
+
+(command/defcmd git-branch-reset
+  "Reset a branch to a revision."
+  :label "Reset Branch"
+  []
+  (use-buffer-root)
+  (def branches (git/run-lines "branch" "--format=%(refname:short)"))
+  (prompt/pick
+    {:prompt "Reset branch: "
+     :candidates (map |(do @{:text $}) branches)
+     :on-accept
+     (fn [candidate]
+       (prompt/activate
+         {:prompt (string "Reset " (candidate :text) " to: ")
+          :on-submit
+          (fn [rev]
+            (def result (git/run "branch" "--force" (candidate :text) rev))
+            (if (= (result :exit) 0)
+              (do (editor-message (string "Reset " (candidate :text) " to " rev))
+                  (when status-buf (do-status-refresh status-buf)))
+              (editor-message (string "Failed: " (result :stderr)))))}))}))
+
 (transient/define :git-branch
   :description "Branch"
   :groups
@@ -1364,34 +1604,70 @@
      :suffixes
      [@{:key "b" :command git-branch-checkout :description "Checkout"}
       @{:key "c" :command git-branch-create-and-checkout :description "Create & checkout"}
-      @{:key "n" :command git-branch-create :description "Create"}]}
+      @{:key "n" :command git-branch-create :description "Create"}
+      @{:key "x" :command git-branch-spinoff :description "Spinoff"}]}
    @{:name "Do"
      :suffixes
      [@{:key "r" :command git-branch-rename :description "Rename"}
-      @{:key "k" :command git-branch-delete :description "Delete"}]}])
+      @{:key "k" :command git-branch-delete :description "Delete"}
+      @{:key "X" :command git-branch-reset :description "Reset" :level 5}]}])
 
 # --- Push transient ---
 
-(command/defcmd git-push-pushremote
-  "Push to push remote."
-  :label "Push"
-  []
-  (use-buffer-root)
-  (def targs (or (dyn :transient-args) @{}))
+(defn- push-build-args
+  "Build git push args from transient infix state."
+  [targs]
   (def args @["push"])
   (when (targs "--force-with-lease") (array/push args "--force-with-lease"))
+  (when (targs "--force") (array/push args "--force"))
+  (when (targs "--no-verify") (array/push args "--no-verify"))
   (when (targs "--set-upstream") (array/push args "--set-upstream"))
   (when (targs "--dry-run") (array/push args "--dry-run"))
-  (def result (git/run ;args))
-  (if (= (result :exit) 0)
-    (do (editor-message "Pushed successfully.")
-        (hook/fire :git-post-operation :push args 0)
-        (when status-buf (do-status-refresh status-buf)))
-    (editor-message (string "Push failed: " (result :stderr)))))
+  args)
 
-(command/defcmd git-push-other
-  "Push to another remote."
-  :label "Push to Other"
+(defn- push-run-async
+  "Run a push command asynchronously, refresh status on success."
+  [args desc]
+  (def root (dyn :git-root))
+  (editor-message (string desc "..."))
+  (ev/spawn
+    (setdyn :git-root root)
+    (def result (git/run ;args))
+    (if (= (result :exit) 0)
+      (do (editor-message (string desc " done."))
+          (hook/fire :git-post-operation :push args 0)
+          (when status-buf (do-status-refresh status-buf)))
+      (editor-message (string desc " failed: " (result :stderr))))))
+
+(command/defcmd git-push-pushremote
+  "Push to the push remote."
+  :label "Push to pushremote"
+  []
+  (use-buffer-root)
+  (def args (push-build-args (or (dyn :transient-args) @{})))
+  (def ref (git/push-remote-ref))
+  (when ref
+    (def parts (string/split "/" ref))
+    (when (>= (length parts) 2)
+      (array/push args (first parts))))
+  (push-run-async args "Pushing to pushremote"))
+
+(command/defcmd git-push-upstream
+  "Push to the upstream remote."
+  :label "Push to upstream"
+  []
+  (use-buffer-root)
+  (def args (push-build-args (or (dyn :transient-args) @{})))
+  (def ref (git/upstream-ref))
+  (when ref
+    (def parts (string/split "/" ref))
+    (when (>= (length parts) 2)
+      (array/push args (first parts))))
+  (push-run-async args "Pushing to upstream"))
+
+(command/defcmd git-push-elsewhere
+  "Push to elsewhere (prompt for remote)."
+  :label "Push elsewhere"
   []
   (use-buffer-root)
   (def remotes (git/run-lines "remote"))
@@ -1400,16 +1676,52 @@
      :candidates (map |(do @{:text $}) remotes)
      :on-accept
      (fn [candidate]
-       (def targs (or (dyn :transient-args) @{}))
-       (def args @["push" (candidate :text)])
-       (when (targs "--force-with-lease") (array/push args "--force-with-lease"))
-       (when (targs "--set-upstream") (array/push args "--set-upstream"))
-       (def result (git/run ;args))
-       (if (= (result :exit) 0)
-         (do (editor-message (string "Pushed to " (candidate :text)))
-             (hook/fire :git-post-operation :push args 0)
-             (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Push failed: " (result :stderr)))))}))
+       (use-buffer-root)
+       (def args (push-build-args (or (dyn :transient-args) @{})))
+       (array/push args (candidate :text))
+       (push-run-async args (string "Pushing to " (candidate :text))))}))
+
+(command/defcmd git-push-tag
+  "Push a tag to a remote."
+  :label "Push tag"
+  []
+  (use-buffer-root)
+  (def tags (git/run-lines "tag" "--sort=-creatordate"))
+  (prompt/pick
+    {:prompt "Push tag: "
+     :candidates (map |(do @{:text $}) tags)
+     :on-accept
+     (fn [tag-candidate]
+       (def remotes (git/run-lines "remote"))
+       (prompt/pick
+         {:prompt "Push tag to remote: "
+          :candidates (map |(do @{:text $}) remotes)
+          :on-accept
+          (fn [remote-candidate]
+            (use-buffer-root)
+            (def args (push-build-args (or (dyn :transient-args) @{})))
+            (array/push args (remote-candidate :text))
+            (array/push args (tag-candidate :text))
+            (push-run-async args
+              (string "Pushing tag " (tag-candidate :text))))}))}))
+
+(command/defcmd git-push-all-tags
+  "Push all tags to a remote."
+  :label "Push all tags"
+  []
+  (use-buffer-root)
+  (def remotes (git/run-lines "remote"))
+  (prompt/pick
+    {:prompt "Push all tags to remote: "
+     :candidates (map |(do @{:text $}) remotes)
+     :on-accept
+     (fn [candidate]
+       (use-buffer-root)
+       (def args (push-build-args (or (dyn :transient-args) @{})))
+       (array/push args (candidate :text))
+       (array/push args "--tags")
+       (push-run-async args
+         (string "Pushing all tags to " (candidate :text))))}))
 
 (transient/define :git-push
   :description "Push"
@@ -1417,34 +1729,81 @@
   [@{:name "Arguments"
      :infixes
      [@{:key "-f" :switch "--force-with-lease" :description "Force with lease"}
+      @{:key "-F" :switch "--force" :description "Force" :level 5}
+      @{:key "-n" :switch "--no-verify" :description "Skip hooks" :level 5}
       @{:key "-u" :switch "--set-upstream" :description "Set upstream"}
-      @{:key "-n" :switch "--dry-run" :description "Dry run"}]}
-   @{:name "Push to"
+      @{:key "-h" :switch "--dry-run" :description "Dry run"}]}
+   @{:name (fn []
+             (def branch (git/current-branch))
+             (if branch
+               (string "Push " branch " to")
+               "Push to"))
      :suffixes
-     [@{:key "p" :command git-push-pushremote :description "Push to pushremote"}
-      @{:key "o" :command git-push-other :description "Push to other"}]}])
+     [@{:key "p" :command git-push-pushremote
+        :description (fn []
+                       (or (git/push-remote-ref) "pushremote (unset)"))}
+      @{:key "u" :command git-push-upstream
+        :description (fn []
+                       (or (git/upstream-ref) "upstream (unset)"))}
+      @{:key "e" :command git-push-elsewhere
+        :description "elsewhere"}]}
+   @{:name "Push"
+     :suffixes
+     [@{:key "T" :command git-push-tag :description "Push a tag"}
+      @{:key "t" :command git-push-all-tags :description "Push all tags"}]}])
 
 # --- Pull transient ---
 
-(command/defcmd git-pull-default
-  "Pull from upstream."
-  :label "Pull"
-  []
-  (use-buffer-root)
-  (def targs (or (dyn :transient-args) @{}))
+(defn- pull-build-args
+  "Build git pull args from transient infix state."
+  [targs]
   (def args @["pull"])
   (when (targs "--rebase") (array/push args "--rebase"))
   (when (targs "--no-rebase") (array/push args "--no-rebase"))
-  (def result (git/run ;args))
-  (if (= (result :exit) 0)
-    (do (editor-message "Pulled successfully.")
-        (hook/fire :git-post-operation :pull args 0)
-        (when status-buf (do-status-refresh status-buf)))
-    (editor-message (string "Pull failed: " (result :stderr)))))
+  (when (targs "--autostash") (array/push args "--autostash"))
+  (when (targs "--ff-only") (array/push args "--ff-only"))
+  (when (targs "--no-ff") (array/push args "--no-ff"))
+  args)
 
-(command/defcmd git-pull-other
-  "Pull from another remote."
-  :label "Pull from Other"
+(defn- pull-run-async
+  "Run a pull command asynchronously, refresh status on success."
+  [args desc]
+  (def root (dyn :git-root))
+  (editor-message (string desc "..."))
+  (ev/spawn
+    (setdyn :git-root root)
+    (def result (git/run ;args))
+    (if (= (result :exit) 0)
+      (do (editor-message (string desc " done."))
+          (hook/fire :git-post-operation :pull args 0)
+          (when status-buf (do-status-refresh status-buf)))
+      (editor-message (string desc " failed: " (result :stderr))))))
+
+(command/defcmd git-pull-pushremote
+  "Pull from the push remote."
+  :label "Pull from pushremote"
+  []
+  (use-buffer-root)
+  (def args (pull-build-args (or (dyn :transient-args) @{})))
+  (def ref (git/push-remote-ref))
+  (when ref
+    (def parts (string/split "/" ref))
+    (when (>= (length parts) 2)
+      (array/push args (first parts))
+      (array/push args (string/join (slice parts 1) "/"))))
+  (pull-run-async args "Pulling from pushremote"))
+
+(command/defcmd git-pull-upstream
+  "Pull from upstream."
+  :label "Pull from upstream"
+  []
+  (use-buffer-root)
+  (def args (pull-build-args (or (dyn :transient-args) @{})))
+  (pull-run-async args "Pulling from upstream"))
+
+(command/defcmd git-pull-elsewhere
+  "Pull from elsewhere (prompt for remote and branch)."
+  :label "Pull from elsewhere"
   []
   (use-buffer-root)
   (def remotes (git/run-lines "remote"))
@@ -1457,47 +1816,92 @@
          {:prompt (string "Branch on " (candidate :text) ": ")
           :on-submit
           (fn [branch]
-            (def result (git/run "pull" (candidate :text) branch))
-            (if (= (result :exit) 0)
-              (do (editor-message "Pulled successfully.")
-                  (hook/fire :git-post-operation :pull
-                             ["pull" (candidate :text) branch] 0)
-                  (when status-buf (do-status-refresh status-buf)))
-              (editor-message (string "Pull failed: " (result :stderr)))))}))}))
+            (use-buffer-root)
+            (def args (pull-build-args (or (dyn :transient-args) @{})))
+            (array/push args (candidate :text))
+            (array/push args branch)
+            (pull-run-async args
+              (string "Pulling from " (candidate :text) "/" branch)))}))}))
 
 (transient/define :git-pull
   :description "Pull"
   :groups
   [@{:name "Arguments"
      :infixes
-     [@{:key "-r" :switch "--rebase" :description "Rebase"}
-      @{:key "-n" :switch "--no-rebase" :description "No rebase"}]}
-   @{:name "Pull from"
+     [@{:key "-f" :switch "--ff-only" :description "Fast-forward only"}
+      @{:key "-r" :switch "--rebase" :description "Rebase"}
+      @{:key "-A" :switch "--autostash" :description "Autostash"}
+      @{:key "-n" :switch "--no-ff" :description "No fast-forward" :level 5}
+      @{:key "-N" :switch "--no-rebase" :description "No rebase" :level 5}]}
+   @{:name (fn []
+             (def branch (git/current-branch))
+             (if branch
+               (string "Pull into " branch " from")
+               "Pull from"))
      :suffixes
-     [@{:key "p" :command git-pull-default :description "Pull from upstream"}
-      @{:key "o" :command git-pull-other :description "Pull from other"}]}])
+     [@{:key "p" :command git-pull-pushremote
+        :description (fn []
+                       (or (git/push-remote-ref) "pushremote (unset)"))}
+      @{:key "u" :command git-pull-upstream
+        :description (fn []
+                       (or (git/upstream-ref) "upstream (unset)"))}
+      @{:key "e" :command git-pull-elsewhere
+        :description "elsewhere"}]}])
 
 # --- Fetch transient ---
 
-(command/defcmd git-fetch-default
-  "Fetch from upstream."
-  :label "Fetch"
-  []
-  (use-buffer-root)
-  (def targs (or (dyn :transient-args) @{}))
+(defn- fetch-build-args
+  "Build git fetch args from transient infix state."
+  [targs]
   (def args @["fetch"])
   (when (targs "--prune") (array/push args "--prune"))
-  (when (targs "--all") (array/push args "--all"))
-  (def result (git/run ;args))
-  (if (= (result :exit) 0)
-    (do (editor-message "Fetched successfully.")
-        (hook/fire :git-post-operation :fetch args 0)
-        (when status-buf (do-status-refresh status-buf)))
-    (editor-message (string "Fetch failed: " (result :stderr)))))
+  (when (targs "--tags") (array/push args "--tags"))
+  (when (targs "--verbose") (array/push args "--verbose"))
+  args)
 
-(command/defcmd git-fetch-other
-  "Fetch from another remote."
-  :label "Fetch from Other"
+(defn- fetch-run-async
+  "Run a fetch command asynchronously, refresh status on success."
+  [args desc]
+  (def root (dyn :git-root))
+  (editor-message (string desc "..."))
+  (ev/spawn
+    (setdyn :git-root root)
+    (def result (git/run ;args))
+    (if (= (result :exit) 0)
+      (do (editor-message (string desc " done."))
+          (hook/fire :git-post-operation :fetch args 0)
+          (when status-buf (do-status-refresh status-buf)))
+      (editor-message (string desc " failed: " (result :stderr))))))
+
+(command/defcmd git-fetch-pushremote
+  "Fetch from the push remote."
+  :label "Fetch from pushremote"
+  []
+  (use-buffer-root)
+  (def args (fetch-build-args (or (dyn :transient-args) @{})))
+  (def ref (git/push-remote-ref))
+  (when ref
+    (def parts (string/split "/" ref))
+    (when (>= (length parts) 2)
+      (array/push args (first parts))))
+  (fetch-run-async args "Fetching from pushremote"))
+
+(command/defcmd git-fetch-upstream
+  "Fetch from upstream."
+  :label "Fetch from upstream"
+  []
+  (use-buffer-root)
+  (def args (fetch-build-args (or (dyn :transient-args) @{})))
+  (def ref (git/upstream-ref))
+  (when ref
+    (def parts (string/split "/" ref))
+    (when (>= (length parts) 2)
+      (array/push args (first parts))))
+  (fetch-run-async args "Fetching from upstream"))
+
+(command/defcmd git-fetch-elsewhere
+  "Fetch from elsewhere (prompt for remote)."
+  :label "Fetch from elsewhere"
   []
   (use-buffer-root)
   (def remotes (git/run-lines "remote"))
@@ -1506,12 +1910,19 @@
      :candidates (map |(do @{:text $}) remotes)
      :on-accept
      (fn [candidate]
-       (def result (git/run "fetch" (candidate :text)))
-       (if (= (result :exit) 0)
-         (do (editor-message (string "Fetched from " (candidate :text)))
-             (hook/fire :git-post-operation :fetch ["fetch" (candidate :text)] 0)
-             (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Fetch failed: " (result :stderr)))))}))
+       (use-buffer-root)
+       (def args (fetch-build-args (or (dyn :transient-args) @{})))
+       (array/push args (candidate :text))
+       (fetch-run-async args (string "Fetching from " (candidate :text))))}))
+
+(command/defcmd git-fetch-all
+  "Fetch from all remotes."
+  :label "Fetch all remotes"
+  []
+  (use-buffer-root)
+  (def args (fetch-build-args (or (dyn :transient-args) @{})))
+  (array/push args "--all")
+  (fetch-run-async args "Fetching all remotes"))
 
 (transient/define :git-fetch
   :description "Fetch"
@@ -1519,28 +1930,42 @@
   [@{:name "Arguments"
      :infixes
      [@{:key "-p" :switch "--prune" :description "Prune deleted branches"}
-      @{:key "-a" :switch "--all" :description "Fetch all remotes"}]}
+      @{:key "-t" :switch "--tags" :description "Fetch tags"}
+      @{:key "-v" :switch "--verbose" :description "Verbose" :level 5}]}
    @{:name "Fetch from"
      :suffixes
-     [@{:key "f" :command git-fetch-default :description "Fetch from upstream"}
-      @{:key "o" :command git-fetch-other :description "Fetch from other"}]}])
+     [@{:key "p" :command git-fetch-pushremote
+        :description (fn []
+                       (or (git/push-remote-ref) "pushremote (unset)"))}
+      @{:key "u" :command git-fetch-upstream
+        :description (fn []
+                       (or (git/upstream-ref) "upstream (unset)"))}
+      @{:key "e" :command git-fetch-elsewhere
+        :description "elsewhere"}
+      @{:key "a" :command git-fetch-all
+        :description "all remotes"}]}])
 
 # --- Stash transient ---
 
-(command/defcmd git-stash-save
-  "Save changes to stash."
-  :label "Stash Save"
+(defn- stash-build-args
+  "Build common stash push args from transient infix state."
+  [targs]
+  (def args @["stash" "push"])
+  (when (targs "--include-untracked") (array/push args "--include-untracked"))
+  (when (targs "--all") (array/push args "--all"))
+  (when (targs "--keep-index") (array/push args "--keep-index"))
+  args)
+
+(command/defcmd git-stash-both
+  "Stash both worktree and index changes."
+  :label "Stash"
   []
   (use-buffer-root)
   (prompt/activate
     {:prompt "Stash message (optional): "
      :on-submit
      (fn [msg]
-       (def targs (or (dyn :transient-args) @{}))
-       (def args @["stash" "push"])
-       (when (targs "--include-untracked") (array/push args "--include-untracked"))
-       (when (targs "--all") (array/push args "--all"))
-       (when (targs "--keep-index") (array/push args "--keep-index"))
+       (def args (stash-build-args (or (dyn :transient-args) @{})))
        (when (> (length (string/trim msg)) 0)
          (array/push args "-m" msg))
        (def result (git/run ;args))
@@ -1549,6 +1974,30 @@
              (hook/fire :git-post-operation :stash args 0)
              (when status-buf (do-status-refresh status-buf)))
          (editor-message (string "Stash failed: " (result :stderr)))))}))
+
+(command/defcmd git-stash-index
+  "Stash only index (staged) changes."
+  :label "Stash index"
+  []
+  (use-buffer-root)
+  (def result (git/run "stash" "push" "--staged"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Stashed index.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Stash failed: " (result :stderr)))))
+
+(command/defcmd git-stash-worktree
+  "Stash only worktree changes (keep index)."
+  :label "Stash worktree"
+  []
+  (use-buffer-root)
+  (def args (stash-build-args (or (dyn :transient-args) @{})))
+  (array/push args "--keep-index")
+  (def result (git/run ;args))
+  (if (= (result :exit) 0)
+    (do (editor-message "Stashed worktree.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Stash failed: " (result :stderr)))))
 
 (command/defcmd git-stash-pop
   "Pop the top stash."
@@ -1579,16 +2028,28 @@
   :label "Stash Drop"
   []
   (use-buffer-root)
-  (prompt/activate
-    {:prompt "Drop top stash? (y/n) "
-     :on-submit
-     (fn [input]
-       (when (= (string/ascii-lower (string/trim input)) "y")
-         (def result (git/run "stash" "drop"))
-         (if (= (result :exit) 0)
-           (do (editor-message "Stash dropped.")
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Stash drop failed: " (result :stderr))))))}))
+  (def result (git/run "stash" "drop"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Stash dropped.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Stash drop failed: " (result :stderr)))))
+
+(command/defcmd git-stash-show
+  "Show the top stash diff."
+  :label "Show stash"
+  []
+  (use-buffer-root)
+  (def result (git/run "stash" "show" "-p"))
+  (when (= (result :exit) 0)
+    (def b (editor/make-view-buffer "*git-stash*" (result :stdout)))
+    (put b :major-mode diff-mode)
+    (put b :hide-gutter true)
+    (put-in b [:locals :git-root] (dyn :git-root))
+    (put-in b [:locals :project-root] (dyn :git-root))
+    (put-in b [:locals :default-directory] (dyn :git-root))
+    (apply-diff-overlays b)
+    (db/pop-to-buffer b (editor/get-state)
+                      :actions [:reuse :same])))
 
 (command/defcmd git-stash-list-cmd
   "List all stashes."
@@ -1610,14 +2071,19 @@
   [@{:name "Arguments"
      :infixes
      [@{:key "-u" :switch "--include-untracked" :description "Include untracked"}
-      @{:key "-a" :switch "--all" :description "Include all (ignored too)"}
+      @{:key "-a" :switch "--all" :description "Include all (ignored too)" :level 5}
       @{:key "-k" :switch "--keep-index" :description "Keep index"}]}
    @{:name "Stash"
      :suffixes
-     [@{:key "z" :command git-stash-save :description "Save"}
+     [@{:key "z" :command git-stash-both :description "Both"}
+      @{:key "i" :command git-stash-index :description "Index"}
+      @{:key "w" :command git-stash-worktree :description "Worktree"}]}
+   @{:name "Use"
+     :suffixes
+     [@{:key "a" :command git-stash-apply :description "Apply"}
       @{:key "p" :command git-stash-pop :description "Pop"}
-      @{:key "a" :command git-stash-apply :description "Apply"}
-      @{:key "d" :command git-stash-drop :description "Drop"}
+      @{:key "k" :command git-stash-drop :description "Drop"}
+      @{:key "v" :command git-stash-show :description "Show"}
       @{:key "l" :command git-stash-list-cmd :description "List"}]}])
 
 # --- Log transient ---
@@ -1649,6 +2115,21 @@
   (when (b :file)
     (open-log-buffer @{:file (b :file)})))
 
+(command/defcmd git-log-reflog
+  "Show reflog."
+  :label "Reflog"
+  []
+  (use-buffer-root)
+  (def result (git/run "reflog" "--format=%h%x00%gs%x00%ar%x00%an%x00"))
+  (when (= (result :exit) 0)
+    (def b (editor/make-view-buffer "*git-reflog*" (result :stdout)))
+    (put b :hide-gutter true)
+    (put-in b [:locals :git-root] (dyn :git-root))
+    (put-in b [:locals :project-root] (dyn :git-root))
+    (put-in b [:locals :default-directory] (dyn :git-root))
+    (db/pop-to-buffer b (editor/get-state)
+                      :actions [:reuse :same])))
+
 (transient/define :git-log
   :description "Log"
   :groups
@@ -1656,15 +2137,17 @@
      :infixes
      [@{:key "-n" :option "--max-count=" :description "Max count" :reader :string}
       @{:key "-a" :switch "--all" :description "All branches"}
-      @{:key "-G" :switch "--no-graph" :description "Hide graph"}
-      @{:key "--author" :option "--author=" :description "Author" :reader :string}
-      @{:key "--since" :option "--since=" :description "Since" :reader :string}
-      @{:key "--grep" :option "--grep=" :description "Grep" :reader :string}]}
+      @{:key "-d" :switch "--decorate" :description "Decorate"}
+      @{:key "-g" :switch "--graph" :description "Show graph" :level 5}
+      @{:key "--author" :option "--author=" :description "Author" :reader :string :level 5}
+      @{:key "--since" :option "--since=" :description "Since" :reader :string :level 5}
+      @{:key "--grep" :option "--grep=" :description "Grep" :reader :string :level 5}]}
    @{:name "Log"
      :suffixes
      [@{:key "l" :command git-log-current :description "Current"}
       @{:key "o" :command git-log-other :description "Other branch"}
-      @{:key "f" :command git-log-file :description "File"}]}])
+      @{:key "f" :command git-log-file :description "File"}
+      @{:key "r" :command git-log-reflog :description "Reflog"}]}])
 
 # --- Diff transient ---
 
@@ -1726,19 +2209,410 @@
          (db/pop-to-buffer b (editor/get-state)
                            :actions [:reuse :same])))}))
 
+(command/defcmd git-diff-worktree
+  "Show diff between HEAD and worktree."
+  :label "Diff worktree"
+  []
+  (use-buffer-root)
+  (def result (git/run "diff" "HEAD"))
+  (when (= (result :exit) 0)
+    (def b (editor/make-view-buffer "*git-diff HEAD*" (result :stdout)))
+    (put b :major-mode diff-mode)
+    (put b :hide-gutter true)
+    (put-in b [:locals :git-root] (dyn :git-root))
+    (put-in b [:locals :project-root] (dyn :git-root))
+    (put-in b [:locals :default-directory] (dyn :git-root))
+    (apply-diff-overlays b)
+    (db/pop-to-buffer b (editor/get-state)
+                      :actions [:reuse :same])))
+
 (transient/define :git-diff
   :description "Diff"
   :groups
   [@{:name "Arguments"
      :infixes
      [@{:key "-w" :switch "--ignore-whitespace" :description "Ignore whitespace"}
-      @{:key "--stat" :switch "--stat" :description "Show stat only"}]}
+      @{:key "-s" :switch "--stat" :description "Show stat only" :level 5}]}
    @{:name "Diff"
      :suffixes
-     [@{:key "d" :command git-diff-dwim :description "Dwim (unstaged)"}
+     [@{:key "d" :command git-diff-dwim :description "Unstaged"}
       @{:key "s" :command git-diff-staged :description "Staged"}
-      @{:key "c" :command git-diff-commit :description "Commit"}
+      @{:key "w" :command git-diff-worktree :description "Worktree (HEAD)"}
+      @{:key "c" :command git-diff-commit :description "Show commit"}
       @{:key "r" :command git-diff-range :description "Range"}]}])
+
+# --- Merge transient ---
+
+(command/defcmd git-merge-commit
+  "Merge a branch."
+  :label "Merge"
+  []
+  (use-buffer-root)
+  (def branches (git/run-lines "branch" "-a" "--format=%(refname:short)"))
+  (prompt/pick
+    {:prompt "Merge branch: "
+     :candidates (map |(do @{:text $}) branches)
+     :on-accept
+     (fn [candidate]
+       (use-buffer-root)
+       (def targs (or (dyn :transient-args) @{}))
+       (def args @["merge"])
+       (when (targs "--ff-only") (array/push args "--ff-only"))
+       (when (targs "--no-ff") (array/push args "--no-ff"))
+       (when (targs "--squash") (array/push args "--squash"))
+       (when (targs "--no-commit") (array/push args "--no-commit"))
+       (array/push args (candidate :text))
+       (def result (git/run ;args))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Merged " (candidate :text)))
+             (hook/fire :git-post-operation :merge args 0)
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Merge failed: " (result :stderr)))))}))
+
+(command/defcmd git-merge-abort
+  "Abort the current merge."
+  :label "Merge abort"
+  []
+  (use-buffer-root)
+  (def result (git/run "merge" "--abort"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Merge aborted.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Abort failed: " (result :stderr)))))
+
+(transient/define :git-merge
+  :description "Merge"
+  :groups
+  [@{:name "Arguments"
+     :infixes
+     [@{:key "-f" :switch "--ff-only" :description "Fast-forward only"}
+      @{:key "-n" :switch "--no-ff" :description "No fast-forward"}
+      @{:key "-s" :switch "--squash" :description "Squash" :level 5}
+      @{:key "-c" :switch "--no-commit" :description "No commit" :level 5}]}
+   @{:name "Merge"
+     :suffixes
+     [@{:key "m" :command git-merge-commit :description "Merge"}
+      @{:key "a" :command git-merge-abort :description "Abort"}]}])
+
+# --- Rebase transient ---
+
+(command/defcmd git-rebase-upstream
+  "Rebase onto upstream."
+  :label "Rebase onto upstream"
+  []
+  (use-buffer-root)
+  (def targs (or (dyn :transient-args) @{}))
+  (def args @["rebase"])
+  (when (targs "--autostash") (array/push args "--autostash"))
+  (when (targs "--interactive") (array/push args "--interactive"))
+  (when (targs "--autosquash") (array/push args "--autosquash"))
+  (def root (dyn :git-root))
+  (editor-message "Rebasing...")
+  (ev/spawn
+    (setdyn :git-root root)
+    (def result (git/run ;args))
+    (if (= (result :exit) 0)
+      (do (editor-message "Rebase done.")
+          (hook/fire :git-post-operation :rebase args 0)
+          (when status-buf (do-status-refresh status-buf)))
+      (editor-message (string "Rebase failed: " (result :stderr))))))
+
+(command/defcmd git-rebase-onto
+  "Rebase onto a specific branch or commit."
+  :label "Rebase onto"
+  []
+  (use-buffer-root)
+  (def branches (git/run-lines "branch" "-a" "--format=%(refname:short)"))
+  (prompt/pick
+    {:prompt "Rebase onto: "
+     :candidates (map |(do @{:text $}) branches)
+     :on-accept
+     (fn [candidate]
+       (use-buffer-root)
+       (def targs (or (dyn :transient-args) @{}))
+       (def args @["rebase"])
+       (when (targs "--autostash") (array/push args "--autostash"))
+       (when (targs "--interactive") (array/push args "--interactive"))
+       (when (targs "--autosquash") (array/push args "--autosquash"))
+       (array/push args (candidate :text))
+       (def root (dyn :git-root))
+       (editor-message (string "Rebasing onto " (candidate :text) "..."))
+       (ev/spawn
+         (setdyn :git-root root)
+         (def result (git/run ;args))
+         (if (= (result :exit) 0)
+           (do (editor-message "Rebase done.")
+               (hook/fire :git-post-operation :rebase args 0)
+               (when status-buf (do-status-refresh status-buf)))
+           (editor-message (string "Rebase failed: " (result :stderr))))))}))
+
+(command/defcmd git-rebase-interactive
+  "Interactive rebase from a commit."
+  :label "Interactive rebase"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Rebase interactively from: "
+     :on-submit
+     (fn [rev]
+       (def root (dyn :git-root))
+       (def targs (or (dyn :transient-args) @{}))
+       (def args @["rebase" "--interactive"])
+       (when (targs "--autostash") (array/push args "--autostash"))
+       (when (targs "--autosquash") (array/push args "--autosquash"))
+       (array/push args rev)
+       (editor-message "Starting interactive rebase...")
+       (ev/spawn
+         (setdyn :git-root root)
+         (def result (git/run ;args))
+         (if (= (result :exit) 0)
+           (do (editor-message "Rebase done.")
+               (when status-buf (do-status-refresh status-buf)))
+           (editor-message (string "Rebase failed: " (result :stderr))))))}))
+
+(command/defcmd git-rebase-continue
+  "Continue an in-progress rebase."
+  :label "Rebase continue"
+  []
+  (use-buffer-root)
+  (def root (dyn :git-root))
+  (ev/spawn
+    (setdyn :git-root root)
+    (def result (git/run "rebase" "--continue"))
+    (if (= (result :exit) 0)
+      (do (editor-message "Rebase continued.")
+          (when status-buf (do-status-refresh status-buf)))
+      (editor-message (string "Continue failed: " (result :stderr))))))
+
+(command/defcmd git-rebase-skip
+  "Skip the current rebase step."
+  :label "Rebase skip"
+  []
+  (use-buffer-root)
+  (def root (dyn :git-root))
+  (ev/spawn
+    (setdyn :git-root root)
+    (def result (git/run "rebase" "--skip"))
+    (if (= (result :exit) 0)
+      (do (editor-message "Skipped.")
+          (when status-buf (do-status-refresh status-buf)))
+      (editor-message (string "Skip failed: " (result :stderr))))))
+
+(command/defcmd git-rebase-abort
+  "Abort the in-progress rebase."
+  :label "Rebase abort"
+  []
+  (use-buffer-root)
+  (def result (git/run "rebase" "--abort"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Rebase aborted.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Abort failed: " (result :stderr)))))
+
+(transient/define :git-rebase
+  :description "Rebase"
+  :groups
+  [@{:name "Arguments"
+     :infixes
+     [@{:key "-A" :switch "--autostash" :description "Autostash"}
+      @{:key "-i" :switch "--interactive" :description "Interactive"}
+      @{:key "-a" :switch "--autosquash" :description "Autosquash"}]}
+   @{:name "Rebase"
+     :suffixes
+     [@{:key "u" :command git-rebase-upstream
+        :description (fn []
+                       (string "onto " (or (git/upstream-ref) "upstream")))}
+      @{:key "o" :command git-rebase-onto :description "onto elsewhere"}
+      @{:key "i" :command git-rebase-interactive :description "interactively"}]}
+   @{:name "Actions"
+     :suffixes
+     [@{:key "r" :command git-rebase-continue :description "Continue"}
+      @{:key "s" :command git-rebase-skip :description "Skip"}
+      @{:key "a" :command git-rebase-abort :description "Abort"}]}])
+
+# --- Cherry-pick transient ---
+
+(command/defcmd git-cherry-pick-commit
+  "Cherry-pick a commit."
+  :label "Cherry-pick"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Cherry-pick commit: "
+     :on-submit
+     (fn [rev]
+       (def targs (or (dyn :transient-args) @{}))
+       (def args @["cherry-pick"])
+       (when (targs "--no-commit") (array/push args "--no-commit"))
+       (when (targs "--edit") (array/push args "--edit"))
+       (array/push args rev)
+       (def result (git/run ;args))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Cherry-picked " rev))
+             (hook/fire :git-post-operation :cherry-pick args 0)
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Cherry-pick failed: " (result :stderr)))))}))
+
+(command/defcmd git-cherry-pick-continue
+  "Continue an in-progress cherry-pick."
+  :label "Cherry-pick continue"
+  []
+  (use-buffer-root)
+  (def result (git/run "cherry-pick" "--continue"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Cherry-pick continued.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Continue failed: " (result :stderr)))))
+
+(command/defcmd git-cherry-pick-abort
+  "Abort the in-progress cherry-pick."
+  :label "Cherry-pick abort"
+  []
+  (use-buffer-root)
+  (def result (git/run "cherry-pick" "--abort"))
+  (if (= (result :exit) 0)
+    (do (editor-message "Cherry-pick aborted.")
+        (when status-buf (do-status-refresh status-buf)))
+    (editor-message (string "Abort failed: " (result :stderr)))))
+
+(transient/define :git-cherry-pick
+  :description "Cherry-pick"
+  :groups
+  [@{:name "Arguments"
+     :infixes
+     [@{:key "-n" :switch "--no-commit" :description "No commit"}
+      @{:key "-e" :switch "--edit" :description "Edit message"}]}
+   @{:name "Cherry-pick"
+     :suffixes
+     [@{:key "A" :command git-cherry-pick-commit :description "Pick"}]}
+   @{:name "Actions"
+     :suffixes
+     [@{:key "r" :command git-cherry-pick-continue :description "Continue"}
+      @{:key "a" :command git-cherry-pick-abort :description "Abort"}]}])
+
+# --- Reset transient ---
+
+(command/defcmd git-reset-soft
+  "Soft reset (keep staging and worktree)."
+  :label "Reset soft"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Soft reset to: "
+     :on-submit
+     (fn [rev]
+       (def result (git/run "reset" "--soft" rev))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Soft reset to " rev))
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Reset failed: " (result :stderr)))))}))
+
+(command/defcmd git-reset-mixed
+  "Mixed reset (keep worktree, unstage)."
+  :label "Reset mixed"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Mixed reset to: "
+     :on-submit
+     (fn [rev]
+       (def result (git/run "reset" "--mixed" rev))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Mixed reset to " rev))
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Reset failed: " (result :stderr)))))}))
+
+(command/defcmd git-reset-hard
+  "Hard reset (discard staging and worktree)."
+  :label "Reset hard"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Hard reset to (THIS DISCARDS CHANGES): "
+     :on-submit
+     (fn [rev]
+       (def result (git/run "reset" "--hard" rev))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Hard reset to " rev))
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Reset failed: " (result :stderr)))))}))
+
+(transient/define :git-reset
+  :description "Reset"
+  :groups
+  [@{:name (fn []
+             (def branch (git/current-branch))
+             (if branch (string "Reset " branch " to") "Reset to"))
+     :suffixes
+     [@{:key "s" :command git-reset-soft :description "Soft (keep all changes staged)"}
+      @{:key "m" :command git-reset-mixed :description "Mixed (keep worktree, unstage)"}
+      @{:key "h" :command git-reset-hard :description "Hard (discard everything)"}]}])
+
+# --- Tag transient ---
+
+(command/defcmd git-tag-create
+  "Create a tag."
+  :label "Create tag"
+  []
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt "Tag name: "
+     :on-submit
+     (fn [name]
+       (prompt/activate
+         {:prompt "Tag message (empty for lightweight): "
+          :on-submit
+          (fn [msg]
+            (def args
+              (if (> (length (string/trim msg)) 0)
+                ["tag" "-a" name "-m" msg]
+                ["tag" name]))
+            (def result (git/run ;args))
+            (if (= (result :exit) 0)
+              (do (editor-message (string "Created tag " name))
+                  (when status-buf (do-status-refresh status-buf)))
+              (editor-message (string "Tag failed: " (result :stderr)))))}))}))
+
+(command/defcmd git-tag-delete
+  "Delete a tag."
+  :label "Delete tag"
+  []
+  (use-buffer-root)
+  (def tags (git/run-lines "tag" "--sort=-creatordate"))
+  (prompt/pick
+    {:prompt "Delete tag: "
+     :candidates (map |(do @{:text $}) tags)
+     :on-accept
+     (fn [candidate]
+       (def result (git/run "tag" "-d" (candidate :text)))
+       (if (= (result :exit) 0)
+         (do (editor-message (string "Deleted tag " (candidate :text)))
+             (when status-buf (do-status-refresh status-buf)))
+         (editor-message (string "Delete failed: " (result :stderr)))))}))
+
+(command/defcmd git-tag-list
+  "List tags."
+  :label "List tags"
+  []
+  (use-buffer-root)
+  (def result (git/run "tag" "-n1" "--sort=-creatordate"))
+  (when (= (result :exit) 0)
+    (def b (editor/make-view-buffer "*git-tags*" (result :stdout)))
+    (put b :hide-gutter true)
+    (put-in b [:locals :git-root] (dyn :git-root))
+    (put-in b [:locals :project-root] (dyn :git-root))
+    (put-in b [:locals :default-directory] (dyn :git-root))
+    (db/pop-to-buffer b (editor/get-state)
+                      :actions [:reuse :split-below])))
+
+(transient/define :git-tag
+  :description "Tag"
+  :groups
+  [@{:name "Tag"
+     :suffixes
+     [@{:key "t" :command git-tag-create :description "Create"}
+      @{:key "k" :command git-tag-delete :description "Delete"}
+      @{:key "l" :command git-tag-list :description "List"}]}])
 
 # --- Git dispatch (top-level transient) ---
 
@@ -1782,10 +2656,35 @@
   :label "Stash"
   [] (transient/activate :git-stash))
 
+(command/defcmd git-merge-transient
+  "Open merge transient."
+  :label "Merge"
+  [] (transient/activate :git-merge))
+
+(command/defcmd git-rebase-transient
+  "Open rebase transient."
+  :label "Rebase"
+  [] (transient/activate :git-rebase))
+
+(command/defcmd git-cherry-pick-transient
+  "Open cherry-pick transient."
+  :label "Cherry-pick"
+  [] (transient/activate :git-cherry-pick))
+
+(command/defcmd git-reset-transient
+  "Open reset transient."
+  :label "Reset"
+  [] (transient/activate :git-reset))
+
+(command/defcmd git-tag-transient
+  "Open tag transient."
+  :label "Tag"
+  [] (transient/activate :git-tag))
+
 (transient/define :git-dispatch
   :description "Git"
   :groups
-  [@{:name "Git"
+  [@{:name "Transient commands"
      :suffixes
      [@{:key "c" :command git-commit-transient :description "Commit..."
         :transient :git-commit}
@@ -1797,6 +2696,16 @@
         :transient :git-pull}
       @{:key "f" :command git-fetch-transient :description "Fetch..."
         :transient :git-fetch}
+      @{:key "m" :command git-merge-transient :description "Merge..."
+        :transient :git-merge}
+      @{:key "r" :command git-rebase-transient :description "Rebase..."
+        :transient :git-rebase}
+      @{:key "A" :command git-cherry-pick-transient :description "Cherry-pick..."
+        :transient :git-cherry-pick}
+      @{:key "X" :command git-reset-transient :description "Reset..."
+        :transient :git-reset}
+      @{:key "t" :command git-tag-transient :description "Tag..."
+        :transient :git-tag}
       @{:key "l" :command git-log-transient :description "Log..."
         :transient :git-log}
       @{:key "d" :command git-diff-transient :description "Diff..."
@@ -1811,6 +2720,11 @@
 (keymap/bind status-keymap "P" (fn [] (transient/activate :git-push)))
 (keymap/bind status-keymap "F" (fn [] (transient/activate :git-pull)))
 (keymap/bind status-keymap "f" (fn [] (transient/activate :git-fetch)))
+(keymap/bind status-keymap "m" (fn [] (transient/activate :git-merge)))
+(keymap/bind status-keymap "r" (fn [] (transient/activate :git-rebase)))
+(keymap/bind status-keymap "A" (fn [] (transient/activate :git-cherry-pick)))
+(keymap/bind status-keymap "X" (fn [] (transient/activate :git-reset)))
+(keymap/bind status-keymap "t" (fn [] (transient/activate :git-tag)))
 (keymap/bind status-keymap "l" (fn [] (transient/activate :git-log)))
 (keymap/bind status-keymap "d" (fn [] (transient/activate :git-diff)))
 (keymap/bind status-keymap "z" (fn [] (transient/activate :git-stash)))
