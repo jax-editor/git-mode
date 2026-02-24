@@ -1512,7 +1512,7 @@
   :label "Checkout Branch"
   []
   (use-buffer-root)
-  (def branches (git/run-lines "branch" "--format=%(refname:short)"))
+  (def branches (git/run-lines "branch" "-a" "--format=%(refname:short)"))
   (prompt/pick
     {:prompt "Checkout branch: "
      :candidates (map |(do @{:text $}) branches)
