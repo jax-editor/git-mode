@@ -7,6 +7,7 @@
 (import jax/editor :as editor)
 (import jax/mode)
 (import jax/keymap)
+(import jax/command)
 (import jax/faces)
 (import jax/hook)
 (import jax/core :prefix "")
@@ -36,8 +37,11 @@
   (set max-lines n))
 
 (def process-keymap (keymap/new))
-(keymap/bind process-keymap "q"
-  (fn [] (editor/message "Use C-x b to switch buffers")))
+(command/defcmd git-process-quit
+  "Show message about switching buffers."
+  :label "Process Quit" []
+  (editor/message "Use C-x b to switch buffers"))
+(keymap/bind process-keymap "q" git-process-quit)
 
 (def process-mode
   @{:name "git-process"

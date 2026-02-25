@@ -271,22 +271,20 @@
   diffs and hide collapsed sections. This is the single rendering path —
   both refresh and toggle operations call this."
   [b results]
-  (def status-data (results :status))
-  (def branch (status-data :branch))
-  (def entries (status-data :entries))
-  (def log-data (results :log))
-  (def stash-data (results :stash))
-  (def diff-unstaged (results :diff-unstaged))
-  (def diff-staged (results :diff-staged))
-  (def unpushed-data (or (results :unpushed) @[]))
-  (def unpulled-data (or (results :unpulled) @[]))
-
-  # Read view state from buffer locals
-  (def expanded-files (or (get-in b [:locals :expanded-files]) @{}))
-  (def collapsed-sections (or (get-in b [:locals :collapsed-sections]) @{}))
-
-  # Save cursor position for restoration
-  (def saved-cursor (or (get-in b [:locals :saved-cursor]) 0))
+  (let [status-data (results :status)
+        branch (status-data :branch)
+        entries (status-data :entries)
+        log-data (results :log)
+        stash-data (results :stash)
+        diff-unstaged (results :diff-unstaged)
+        diff-staged (results :diff-staged)
+        unpushed-data (or (results :unpushed) @[])
+        unpulled-data (or (results :unpulled) @[])
+        # Read view state from buffer locals
+        expanded-files (or (get-in b [:locals :expanded-files]) @{})
+        collapsed-sections (or (get-in b [:locals :collapsed-sections]) @{})
+        # Save cursor position for restoration
+        saved-cursor (or (get-in b [:locals :saved-cursor]) 0)]
 
   # Clear buffer
   (put b :readonly false)
@@ -532,7 +530,7 @@
     (set-cursor (min saved-cursor max-pos)))
 
   # Fire hook
-  (hook/fire :git-status-refreshed b))
+  (hook/fire :git-status-refreshed b)))
 
 (defn- re-render-status
   "Re-render the status buffer from cached git data.
@@ -780,14 +778,14 @@
   "Stage the file, hunk, or section at point."
   :label "Stage"
   []
-  (def b (buffer))
-  (def line (cursor-line))
-  (def section (sec/section-at-line b line))
-  (unless section (break))
-  (def data (section :data))
-  (def root (get-in b [:locals :git-root]))
-  (unless root (break))
-  (use-buffer-root)
+  (let [b (buffer)
+        line (cursor-line)
+        section (sec/section-at-line b line)]
+    (unless section (break))
+    (let [data (section :data)
+          root (get-in b [:locals :git-root])]
+      (unless root (break))
+      (use-buffer-root)
 
   (case (section :type)
     # Stage a single file
@@ -829,7 +827,7 @@
   # Clear selection after staging
   (line-select-clear b)
   (do-status-refresh b)
-  (hook/fire :git-post-operation :stage [] 0))
+  (hook/fire :git-post-operation :stage [] 0))))
 
 (command/defcmd git-unstage
   "Unstage the file, hunk, or section at point."
@@ -1030,7 +1028,7 @@
       (let [basename (last (string/split "/" root))
             name (string "*git-status: " basename "*")
             b (buf/new name)]
-        (put b :major-mode status-mode)
+        (mode/activate-major b status-mode)
         (put b :readonly true)
         (put b :hide-gutter true)
         (undo/init b)
@@ -1078,7 +1076,9 @@
 
 (mode/register commit-mode)
 
-(defn- finish-commit []
+(command/defcmd git-finish-commit
+  "Finalize the commit with the current buffer content."
+  :label "Finish Commit" []
   (use-buffer-root)
   (def b (buffer))
   (def text (buf/slice b 0 (buf/length b)))
@@ -1112,19 +1112,21 @@
       (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Commit failed: " (result :stderr)))))
 
-(defn- cancel-commit []
+(command/defcmd git-cancel-commit
+  "Cancel the current commit."
+  :label "Cancel Commit" []
   (editor-message "Commit cancelled.")
   (set commit-buf nil)
   (git-quit))
 
-(keymap/bind commit-keymap "C-c C-c" finish-commit)
-(keymap/bind commit-keymap "C-c C-k" cancel-commit)
+(keymap/bind commit-keymap "C-c C-c" git-finish-commit)
+(keymap/bind commit-keymap "C-c C-k" git-cancel-commit)
 
 (defn- open-commit-buffer [&opt amend]
   (def root (dyn :git-root))
   (def b (buf/new "*git-commit*"))
   (set commit-buf b)
-  (put b :major-mode commit-mode)
+  (mode/activate-major b commit-mode)
   (put-in b [:locals :git-root] root)
   (put-in b [:locals :project-root] root)
   (put-in b [:locals :default-directory] root)
@@ -1236,7 +1238,7 @@
     (def b (editor/make-view-buffer
              (string "*git-diff " hash "*")
              (result :stdout)))
-    (put b :major-mode diff-mode)
+    (mode/activate-major b diff-mode)
     (put b :hide-gutter true)
     (put-in b [:locals :git-root] root)
     (put-in b [:locals :project-root] root)
@@ -1299,7 +1301,7 @@
 
   (def b (buf/new "*git-log*"))
   (set log-buf b)
-  (put b :major-mode log-mode)
+  (mode/activate-major b log-mode)
   (put b :hide-gutter true)
   (put-in b [:locals :git-root] (dyn :git-root))
   (put-in b [:locals :project-root] (dyn :git-root))
@@ -1349,9 +1351,7 @@
   (def vim (require "jax/vim-mode"))
   (def exclude (get-in vim ['exclude-mode :value]))
   (when exclude
-    (exclude "git-status")
-    (exclude "git-log")
-    (exclude "git-diff")))
+    (exclude "git-status")))
 
 (set apply-diff-overlays
   (fn [b]
@@ -1377,7 +1377,7 @@
     (break))
 
   (def b (editor/make-view-buffer "*git-diff*" (result :stdout)))
-  (put b :major-mode diff-mode)
+  (mode/activate-major b diff-mode)
   (put b :hide-gutter true)
   (put-in b [:locals :git-root] (dyn :git-root))
   (put-in b [:locals :project-root] (dyn :git-root))
@@ -1425,7 +1425,7 @@
   (when (= (result :exit) 0)
     (def b (buf/new "*git-commit*"))
     (set commit-buf b)
-    (put b :major-mode commit-mode)
+    (mode/activate-major b commit-mode)
     (put-in b [:locals :git-root] root)
     (put-in b [:locals :project-root] root)
     (put-in b [:locals :default-directory] root)
@@ -2090,7 +2090,7 @@
   (def result (git/run "stash" "show" "-p"))
   (when (= (result :exit) 0)
     (def b (editor/make-view-buffer "*git-stash*" (result :stdout)))
-    (put b :major-mode diff-mode)
+    (mode/activate-major b diff-mode)
     (put b :hide-gutter true)
     (put-in b [:locals :git-root] (dyn :git-root))
     (put-in b [:locals :project-root] (dyn :git-root))
@@ -2225,7 +2225,7 @@
          (def b (editor/make-view-buffer
                   (string "*git-diff " hash "*")
                   (result :stdout)))
-         (put b :major-mode diff-mode)
+         (mode/activate-major b diff-mode)
          (put b :hide-gutter true)
          (put-in b [:locals :git-root] (dyn :git-root))
          (put-in b [:locals :project-root] (dyn :git-root))
@@ -2248,7 +2248,7 @@
          (def b (editor/make-view-buffer
                   (string "*git-diff " range "*")
                   (result :stdout)))
-         (put b :major-mode diff-mode)
+         (mode/activate-major b diff-mode)
          (put b :hide-gutter true)
          (put-in b [:locals :git-root] (dyn :git-root))
          (put-in b [:locals :project-root] (dyn :git-root))
@@ -2265,7 +2265,7 @@
   (def result (git/run "diff" "HEAD"))
   (when (= (result :exit) 0)
     (def b (editor/make-view-buffer "*git-diff HEAD*" (result :stdout)))
-    (put b :major-mode diff-mode)
+    (mode/activate-major b diff-mode)
     (put b :hide-gutter true)
     (put-in b [:locals :git-root] (dyn :git-root))
     (put-in b [:locals :project-root] (dyn :git-root))
