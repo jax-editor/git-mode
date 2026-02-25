@@ -60,6 +60,8 @@ In your `init.janet`:
 | `^` | Parent | Jump to parent section |
 | `1`–`4` | Level | Set section visibility level |
 | `RET` | Visit | Open file or show commit diff |
+| `C-w` | Copy section value | Copy value at point (SHA, path, ref) |
+| `M-w` | Copy buffer revision | Copy revision for current buffer |
 | `q` | Quit | Bury the git buffer |
 | `$` | Process | Show process buffer |
 | `c` | Commit | Open commit transient |
@@ -84,6 +86,8 @@ In your `init.janet`:
 |-----|---------|-------------|
 | `RET` | Show commit | Show diff for commit at point |
 | `n` / `p` | Navigate | Next/previous entry |
+| `C-w` | Copy section value | Copy full SHA of commit at point |
+| `M-w` | Copy buffer revision | Copy revision for current buffer |
 | `q` | Quit | Bury the log buffer |
 
 ## Transient Menus

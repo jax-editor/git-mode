@@ -23,6 +23,8 @@
 (import jax/core :prefix "")
 (import jax/commands/movement :as move)
 (import jax/undo :as undo)
+(import jax/kill-ring)
+(import jax/package)
 
 (import ./plumbing :as git)
 (import ./sections :as sec)
@@ -134,21 +136,7 @@
 (var- refresh-generation 0)
 (def- refresh-debounce-delay 0.3)
 
-# Forward declarations for keymaps that reference commands
-(var do-refresh nil)
-(var do-stage nil)
-(var do-unstage nil)
-(var do-discard nil)
-(var do-visit nil)
-(var do-toggle-section nil)
-(var do-next-section nil)
-(var do-prev-section nil)
-(var do-next-sibling nil)
-(var do-prev-sibling nil)
-(var do-section-parent nil)
-(var quit-git-buffer nil)
-(var show-process-buffer nil)
-(var set-visibility-level nil)
+# Forward declarations for mutual references
 (var show-commit-diff nil)
 (var apply-diff-overlays nil)
 (var diff-mode nil)
@@ -156,26 +144,6 @@
 # --- Status mode keymap ---
 
 (def status-keymap (keymap/new))
-
-# Section navigation
-(keymap/bind status-keymap "n" (fn [] (do-next-section)))
-(keymap/bind status-keymap "p" (fn [] (do-prev-section)))
-(keymap/bind status-keymap "M-n" (fn [] (do-next-sibling)))
-(keymap/bind status-keymap "M-p" (fn [] (do-prev-sibling)))
-(keymap/bind status-keymap "^" (fn [] (do-section-parent)))
-(keymap/bind status-keymap "tab" (fn [] (do-toggle-section)))
-
-# Operations
-(def g-map (keymap/new))
-(keymap/bind g-map "r" (fn [] (do-refresh)))
-(keymap/bind g-map "g" (fn [] (move/beginning-of-buffer)))
-(keymap/bind status-keymap "g" g-map)
-(keymap/bind status-keymap "G" (fn [] (move/end-of-buffer)))
-(keymap/bind status-keymap "s" (fn [] (do-stage)))
-(keymap/bind status-keymap "u" (fn [] (do-unstage)))
-(keymap/bind status-keymap "x" (fn [] (do-discard)))
-(keymap/bind status-keymap "enter" (fn [] (do-visit)))
-(keymap/bind status-keymap "q" (fn [] (quit-git-buffer)))
 
 # --- Cursor helpers (needed early by line selection and navigation) ---
 
@@ -242,47 +210,36 @@
     (when-let [pos (buf/line-byte-offset b new-end)]
       (set-cursor pos))))
 
-(defn- toggle-line-select []
+(command/defcmd git-toggle-line-select
+  "Toggle line selection mode for region staging."
+  :label "Toggle Line Select"
+  []
   (def b (buffer))
   (if (line-select-state b)
     (line-select-clear b)
     (line-select-start b (cursor-line))))
 
-(keymap/bind status-keymap "v" toggle-line-select)
-(keymap/bind status-keymap "V" toggle-line-select)
+(command/defcmd git-clear-selection
+  "Clear line selection."
+  :label "Clear Selection"
+  []
+  (line-select-clear (buffer)))
 
-(keymap/bind status-keymap "escape"
-  (fn [] (line-select-clear (buffer))))
+(command/defcmd git-next-line
+  "Move to the next line, extending selection if active."
+  :label "Next Line"
+  []
+  (if (line-select-state (buffer))
+    (line-select-move 1)
+    (move/next-line 1)))
 
-(keymap/bind status-keymap "C-g"
-  (fn [] (line-select-clear (buffer))))
-
-# j/k — line movement, selection-aware
-(keymap/bind status-keymap "j"
-  (fn []
-    (if (line-select-state (buffer))
-      (line-select-move 1)
-      (move/next-line 1))))
-
-(keymap/bind status-keymap "k"
-  (fn []
-    (if (line-select-state (buffer))
-      (line-select-move -1)
-      (move/prev-line 1))))
-
-# Transients — bound after transient definitions below
-(keymap/bind status-keymap "$"
-  (fn [] (show-process-buffer)))
-
-# Level visibility
-(keymap/bind status-keymap "1"
-  (fn [] (set-visibility-level 1)))
-(keymap/bind status-keymap "2"
-  (fn [] (set-visibility-level 2)))
-(keymap/bind status-keymap "3"
-  (fn [] (set-visibility-level 3)))
-(keymap/bind status-keymap "4"
-  (fn [] (set-visibility-level 4)))
+(command/defcmd git-prev-line
+  "Move to the previous line, extending selection if active."
+  :label "Previous Line"
+  []
+  (if (line-select-state (buffer))
+    (line-select-move -1)
+    (move/prev-line 1)))
 
 (def status-mode
   @{:name "git-status"
@@ -665,86 +622,97 @@
 
 # --- Section navigation commands ---
 
-(set do-next-section
-  (fn []
-    (def b (buffer))
-    (def line (sec/next-section-line b (cursor-line)))
-    (goto-line b line)))
+(command/defcmd git-next-section
+  "Move to the next section."
+  :label "Next Section"
+  []
+  (def b (buffer))
+  (def line (sec/next-section-line b (cursor-line)))
+  (goto-line b line))
 
-(set do-prev-section
-  (fn []
-    (def b (buffer))
-    (def line (sec/prev-section-line b (cursor-line)))
-    (goto-line b line)))
+(command/defcmd git-prev-section
+  "Move to the previous section."
+  :label "Previous Section"
+  []
+  (def b (buffer))
+  (def line (sec/prev-section-line b (cursor-line)))
+  (goto-line b line))
 
-(set do-next-sibling
-  (fn []
-    (def b (buffer))
-    (def line (sec/next-sibling-line b (cursor-line)))
-    (goto-line b line)))
+(command/defcmd git-next-sibling
+  "Move to the next sibling section."
+  :label "Next Sibling Section"
+  []
+  (def b (buffer))
+  (def line (sec/next-sibling-line b (cursor-line)))
+  (goto-line b line))
 
-(set do-prev-sibling
-  (fn []
-    (def b (buffer))
-    (def line (sec/prev-sibling-line b (cursor-line)))
-    (goto-line b line)))
+(command/defcmd git-prev-sibling
+  "Move to the previous sibling section."
+  :label "Previous Sibling Section"
+  []
+  (def b (buffer))
+  (def line (sec/prev-sibling-line b (cursor-line)))
+  (goto-line b line))
 
-(set do-section-parent
-  (fn []
-    (def b (buffer))
-    (def line (sec/parent-section-line b (cursor-line)))
-    (goto-line b line)))
+(command/defcmd git-section-parent
+  "Move to the parent section."
+  :label "Section Parent"
+  []
+  (def b (buffer))
+  (def line (sec/parent-section-line b (cursor-line)))
+  (goto-line b line))
 
-(set do-toggle-section
-  (fn []
-    (def b (buffer))
-    (def line (cursor-line))
-    (def section (sec/section-at-line b line))
-    (when section
-      (def expanded-files
-        (or (get-in b [:locals :expanded-files]) @{}))
-      (def collapsed-sections
-        (or (get-in b [:locals :collapsed-sections]) @{}))
-      (case (section :type)
-        # File sections toggle inline diff expansion
-        :file
-        (let [expand-key (get-in section [:data :expand-key])]
-          (when expand-key
-            (if (expanded-files expand-key)
-              (put expanded-files expand-key nil)
-              (put expanded-files expand-key true))
-            (put-in b [:locals :expanded-files] expanded-files)
-            (re-render-status b)))
-
-        # Section headers toggle collapse
-        :section-header
-        (let [status-key (get-in section [:data :status])]
-          (when status-key
-            (if (collapsed-sections status-key)
-              (put collapsed-sections status-key nil)
-              (put collapsed-sections status-key true))
-            (put-in b [:locals :collapsed-sections] collapsed-sections)
-            (re-render-status b)))
-
-        # Hunk sections — toggle parent file
-        :hunk
-        (when-let [parent (section :parent)]
-          (when-let [expand-key (get-in parent [:data :expand-key])]
-            (put expanded-files expand-key nil)
-            (put-in b [:locals :expanded-files] expanded-files)
-            (re-render-status b)))))))
-
-(set set-visibility-level
-  (fn [level]
-    (def b (buffer))
-    # Level 1 = collapse all, level 4 = expand all
+(command/defcmd git-toggle-section
+  "Toggle visibility of the section at point."
+  :label "Toggle Section"
+  []
+  (def b (buffer))
+  (def line (cursor-line))
+  (def section (sec/section-at-line b line))
+  (when section
+    (def expanded-files
+      (or (get-in b [:locals :expanded-files]) @{}))
     (def collapsed-sections
       (or (get-in b [:locals :collapsed-sections]) @{}))
-    (if (<= level 1)
-      (do
-        (each key [:untracked :unstaged :staged :log :stash]
-          (put collapsed-sections key true))
-        (put-in b [:locals :expanded-files] @{}))
+    (case (section :type)
+      # File sections toggle inline diff expansion
+      :file
+      (let [expand-key (get-in section [:data :expand-key])]
+        (when expand-key
+          (if (expanded-files expand-key)
+            (put expanded-files expand-key nil)
+            (put expanded-files expand-key true))
+          (put-in b [:locals :expanded-files] expanded-files)
+          (re-render-status b)))
+
+      # Section headers toggle collapse
+      :section-header
+      (let [status-key (get-in section [:data :status])]
+        (when status-key
+          (if (collapsed-sections status-key)
+            (put collapsed-sections status-key nil)
+            (put collapsed-sections status-key true))
+          (put-in b [:locals :collapsed-sections] collapsed-sections)
+          (re-render-status b)))
+
+      # Hunk sections — toggle parent file
+      :hunk
+      (when-let [parent (section :parent)]
+        (when-let [expand-key (get-in parent [:data :expand-key])]
+          (put expanded-files expand-key nil)
+          (put-in b [:locals :expanded-files] expanded-files)
+          (re-render-status b))))))
+
+(defn- set-visibility-level [level]
+  (def b (buffer))
+  # Level 1 = collapse all, level 4 = expand all
+  (def collapsed-sections
+    (or (get-in b [:locals :collapsed-sections]) @{}))
+  (if (<= level 1)
+    (do
+      (each key [:untracked :unstaged :staged :log :stash]
+        (put collapsed-sections key true))
+      (put-in b [:locals :expanded-files] @{}))
       (do
         (each key [:untracked :unstaged :staged :log :stash]
           (put collapsed-sections key nil))
@@ -753,7 +721,23 @@
           # files exist, so just clear collapsed state for now
           nil)))
     (put-in b [:locals :collapsed-sections] collapsed-sections)
-    (re-render-status b)))
+    (re-render-status b))
+
+(command/defcmd git-visibility-level-1
+  "Collapse all sections." :label "Visibility Level 1" []
+  (set-visibility-level 1))
+
+(command/defcmd git-visibility-level-2
+  "Show section headers only." :label "Visibility Level 2" []
+  (set-visibility-level 2))
+
+(command/defcmd git-visibility-level-3
+  "Show section headers and files." :label "Visibility Level 3" []
+  (set-visibility-level 3))
+
+(command/defcmd git-visibility-level-4
+  "Expand all sections and files." :label "Visibility Level 4" []
+  (set-visibility-level 4))
 
 # --- Staging operations ---
 
@@ -792,112 +776,33 @@
   (when-let [file-sec (find-parent-file-section section)]
     (get-in file-sec [:data :status])))
 
-(set do-stage
-  (fn []
-    (def b (buffer))
-    (def line (cursor-line))
-    (def section (sec/section-at-line b line))
-    (unless section (break))
-    (def data (section :data))
-    (def root (get-in b [:locals :git-root]))
-    (unless root (break))
-    (use-buffer-root)
+(command/defcmd git-stage
+  "Stage the file, hunk, or section at point."
+  :label "Stage"
+  []
+  (def b (buffer))
+  (def line (cursor-line))
+  (def section (sec/section-at-line b line))
+  (unless section (break))
+  (def data (section :data))
+  (def root (get-in b [:locals :git-root]))
+  (unless root (break))
+  (use-buffer-root)
 
-    (case (section :type)
-      # Stage a single file
-      :file
-      (do
-        (case (data :status)
-          :untracked (git/run "add" (data :path))
-          :unstaged (git/run "add" (data :path))
-          nil)
-        (when (data :path)
-          (editor/message (string "Staged " (data :path)))))
-
-      # Stage a hunk (or region within a hunk)
-      :hunk
-      (when (= (file-status-for-hunk section) :unstaged)
-        (def file-diff (data :file-diff))
-        (def hunk (data :hunk))
-        (def region (hunk-region-lines b section))
-        (def patch
-          (if region
-            (git/make-region-patch file-diff hunk (region 0) (region 1))
-            (git/make-hunk-patch file-diff hunk)))
-        (def result (git/run-with-input patch "apply" "--cached"))
-        (if (= (result :exit) 0)
-          (editor/message (if region "Staged region." "Staged hunk."))
-          (editor/message (string "Stage hunk failed: " (result :stderr)))))
-
-      # Stage all files in a section header
-      :section-header
+  (case (section :type)
+    # Stage a single file
+    :file
+    (do
       (case (data :status)
-        :untracked
-        (each child (section :children)
-          (git/run "add" (get-in child [:data :path])))
-        :unstaged
-        (each child (section :children)
-          (git/run "add" (get-in child [:data :path])))
-        nil))
+        :untracked (git/run "add" (data :path))
+        :unstaged (git/run "add" (data :path))
+        nil)
+      (when (data :path)
+        (editor/message (string "Staged " (data :path)))))
 
-    # Clear selection after staging
-    (line-select-clear b)
-    (do-status-refresh b)
-    (hook/fire :git-post-operation :stage [] 0)))
-
-(set do-unstage
-  (fn []
-    (def b (buffer))
-    (def line (cursor-line))
-    (def section (sec/section-at-line b line))
-    (unless section (break))
-    (def data (section :data))
-    (use-buffer-root)
-
-    (case (section :type)
-      :file
-      (when (= (data :status) :staged)
-        (git/run "restore" "--staged" (data :path)))
-
-      :hunk
-      (when (= (file-status-for-hunk section) :staged)
-        (def file-diff (data :file-diff))
-        (def hunk (data :hunk))
-        (def region (hunk-region-lines b section))
-        (def patch
-          (if region
-            (git/make-region-patch file-diff hunk (region 0) (region 1) true)
-            (git/make-hunk-patch file-diff hunk)))
-        (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
-        (if (= (result :exit) 0)
-          (editor/message (if region "Unstaged region." "Unstaged hunk."))
-          (editor/message (string "Unstage hunk failed: " (result :stderr)))))
-
-      :section-header
-      (when (= (data :status) :staged)
-        (each child (section :children)
-          (git/run "restore" "--staged" (get-in child [:data :path])))))
-
-    (line-select-clear b)
-    (do-status-refresh b)
-    (hook/fire :git-post-operation :unstage [] 0)))
-
-(set do-discard
-  (fn []
-    (def b (buffer))
-    (def line (cursor-line))
-    (def section (sec/section-at-line b line))
-    (unless section (break))
-    (def data (section :data))
-    (use-buffer-root)
-
-    (defn discard-file [path status]
-      (case status
-        :untracked (os/rm (string (get-in b [:locals :git-root]) "/" path))
-        :unstaged (git/run "checkout" "--" path)
-        nil))
-
-    (defn discard-hunk []
+    # Stage a hunk (or region within a hunk)
+    :hunk
+    (when (= (file-status-for-hunk section) :unstaged)
       (def file-diff (data :file-diff))
       (def hunk (data :hunk))
       (def region (hunk-region-lines b section))
@@ -905,23 +810,108 @@
         (if region
           (git/make-region-patch file-diff hunk (region 0) (region 1))
           (git/make-hunk-patch file-diff hunk)))
-      (git/run-with-input patch "apply" "--reverse"))
+      (def result (git/run-with-input patch "apply" "--cached"))
+      (if (= (result :exit) 0)
+        (editor/message (if region "Staged region." "Staged hunk."))
+        (editor/message (string "Stage hunk failed: " (result :stderr)))))
 
-    (prompt/activate
-      {:prompt "Discard changes? (y/n) "
-       :on-submit
-       (fn [input]
-         (when (= (string/ascii-lower (string/trim input)) "y")
-           (case (section :type)
-             :file (discard-file (data :path) (data :status))
-             :hunk (discard-hunk)
-             :section-header
-             (each child (section :children)
-               (discard-file (get-in child [:data :path])
-                             (get-in child [:data :status]))))
-           (line-select-clear b)
-           (do-status-refresh b)
-           (hook/fire :git-post-operation :discard [] 0)))})))
+    # Stage all files in a section header
+    :section-header
+    (case (data :status)
+      :untracked
+      (each child (section :children)
+        (git/run "add" (get-in child [:data :path])))
+      :unstaged
+      (each child (section :children)
+        (git/run "add" (get-in child [:data :path])))
+      nil))
+
+  # Clear selection after staging
+  (line-select-clear b)
+  (do-status-refresh b)
+  (hook/fire :git-post-operation :stage [] 0))
+
+(command/defcmd git-unstage
+  "Unstage the file, hunk, or section at point."
+  :label "Unstage"
+  []
+  (def b (buffer))
+  (def line (cursor-line))
+  (def section (sec/section-at-line b line))
+  (unless section (break))
+  (def data (section :data))
+  (use-buffer-root)
+
+  (case (section :type)
+    :file
+    (when (= (data :status) :staged)
+      (git/run "restore" "--staged" (data :path)))
+
+    :hunk
+    (when (= (file-status-for-hunk section) :staged)
+      (def file-diff (data :file-diff))
+      (def hunk (data :hunk))
+      (def region (hunk-region-lines b section))
+      (def patch
+        (if region
+          (git/make-region-patch file-diff hunk (region 0) (region 1) true)
+          (git/make-hunk-patch file-diff hunk)))
+      (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
+      (if (= (result :exit) 0)
+        (editor/message (if region "Unstaged region." "Unstaged hunk."))
+        (editor/message (string "Unstage hunk failed: " (result :stderr)))))
+
+    :section-header
+    (when (= (data :status) :staged)
+      (each child (section :children)
+        (git/run "restore" "--staged" (get-in child [:data :path])))))
+
+  (line-select-clear b)
+  (do-status-refresh b)
+  (hook/fire :git-post-operation :unstage [] 0))
+
+(command/defcmd git-discard
+  "Discard changes for the file, hunk, or section at point."
+  :label "Discard"
+  []
+  (def b (buffer))
+  (def line (cursor-line))
+  (def section (sec/section-at-line b line))
+  (unless section (break))
+  (def data (section :data))
+  (use-buffer-root)
+
+  (defn discard-file [path status]
+    (case status
+      :untracked (os/rm (string (get-in b [:locals :git-root]) "/" path))
+      :unstaged (git/run "checkout" "--" path)
+      nil))
+
+  (defn discard-hunk []
+    (def file-diff (data :file-diff))
+    (def hunk (data :hunk))
+    (def region (hunk-region-lines b section))
+    (def patch
+      (if region
+        (git/make-region-patch file-diff hunk (region 0) (region 1))
+        (git/make-hunk-patch file-diff hunk)))
+    (git/run-with-input patch "apply" "--reverse"))
+
+  (prompt/activate
+    {:prompt "Discard changes? (y/n) "
+     :on-submit
+     (fn [input]
+       (when (= (string/ascii-lower (string/trim input)) "y")
+         (case (section :type)
+           :file (discard-file (data :path) (data :status))
+           :hunk (discard-hunk)
+           :section-header
+           (each child (section :children)
+             (discard-file (get-in child [:data :path])
+                           (get-in child [:data :status]))))
+         (line-select-clear b)
+         (do-status-refresh b)
+         (hook/fire :git-post-operation :discard [] 0)))}))
 
 # --- Visit thing at point ---
 
@@ -1001,33 +991,37 @@
         (when-let [pos (buf/line-byte-offset opened target-line)]
           (set-cursor pos))))))
 
-(set do-visit
-  (fn []
-    (def b (buffer))
-    (def line (cursor-line))
-    (def section (sec/section-at-line b line))
-    (unless section (break))
+(command/defcmd git-visit
+  "Visit the thing at point (file, hunk line, or commit)."
+  :label "Visit"
+  []
+  (def b (buffer))
+  (def line (cursor-line))
+  (def section (sec/section-at-line b line))
+  (unless section (break))
 
-    (case (section :type)
-      :file
-      (let [path (get-in section [:data :path])
-            root (get-in b [:locals :git-root])]
-        (when (and path root)
-          (editor/open-file (string root "/" path) (editor/get-state))))
+  (case (section :type)
+    :file
+    (let [path (get-in section [:data :path])
+          root (get-in b [:locals :git-root])]
+      (when (and path root)
+        (editor/open-file (string root "/" path) (editor/get-state))))
 
-      :hunk
-      (visit-hunk-line b line section)
+    :hunk
+    (visit-hunk-line b line section)
 
-      :commit
-      (let [hash (get-in section [:data :hash])]
-        (when hash (show-commit-diff hash)))
+    :commit
+    (let [hash (get-in section [:data :hash])]
+      (when hash (show-commit-diff hash)))
 
-      nil)))
+    nil))
 
-(set do-refresh
-  (fn []
-    (def b (buffer))
-    (do-status-refresh b)))
+(command/defcmd git-refresh
+  "Refresh the current git buffer."
+  :label "Refresh"
+  []
+  (def b (buffer))
+  (do-status-refresh b))
 
 # --- Status buffer creation ---
 
@@ -1045,6 +1039,29 @@
         (put-in b [:locals :default-directory] root)
         (put status-bufs root b)
         b)))
+
+# ════════════════════════════════════════════════════════════════════
+# Shared buffer commands (defined early so commit/log code can use them)
+# ════════════════════════════════════════════════════════════════════
+
+(command/defcmd git-quit
+  "Quit the current git buffer."
+  :label "Quit"
+  []
+  (def state (editor/get-state))
+  (def p (pane))
+  (def prev (db/pane-previous-buffer p state))
+  (if prev
+    (put p :buffer prev)
+    (editor-message "No previous buffer")))
+
+(command/defcmd git-show-process-buffer
+  "Show the git process output buffer."
+  :label "Show Process Buffer"
+  []
+  (def b (git/get-process-buffer))
+  (db/pop-to-buffer b (editor/get-state)
+                    :actions [:reuse :split-below]))
 
 # ════════════════════════════════════════════════════════════════════
 # Commit
@@ -1089,7 +1106,7 @@
     (do
       (editor-message "Committed.")
       (set commit-buf nil)
-      (quit-git-buffer)
+      (git-quit)
       (hook/fire :git-commit-finished msg)
       (hook/fire :git-post-operation :commit args 0)
       (when status-buf (do-status-refresh status-buf)))
@@ -1098,7 +1115,7 @@
 (defn- cancel-commit []
   (editor-message "Commit cancelled.")
   (set commit-buf nil)
-  (quit-git-buffer))
+  (git-quit))
 
 (keymap/bind commit-keymap "C-c C-c" finish-commit)
 (keymap/bind commit-keymap "C-c C-k" cancel-commit)
@@ -1224,21 +1241,20 @@
     (put-in b [:locals :git-root] root)
     (put-in b [:locals :project-root] root)
     (put-in b [:locals :default-directory] root)
+    (put-in b [:locals :git-revision] hash)
     (db/pop-to-buffer b (editor/get-state)
                       :actions [:reuse :split-below])
     (apply-diff-overlays b))))
 
-(keymap/bind log-keymap "enter"
-  (fn []
-    (def b (buffer))
-    (def line (cursor-line))
-    (def section (sec/section-at-line b line))
-    (when (and section (= (section :type) :commit))
-      (show-commit-diff (get-in section [:data :hash])))))
-
-(keymap/bind log-keymap "q" (fn [] (quit-git-buffer)))
-(keymap/bind log-keymap "n" (fn [] (do-next-section)))
-(keymap/bind log-keymap "p" (fn [] (do-prev-section)))
+(command/defcmd git-log-visit
+  "Show the commit at point in a diff buffer."
+  :label "Visit Commit"
+  []
+  (def b (buffer))
+  (def line (cursor-line))
+  (def section (sec/section-at-line b line))
+  (when (and section (= (section :type) :commit))
+    (show-commit-diff (get-in section [:data :hash]))))
 
 (def- hash-extract-peg
   "PEG to extract the first hex hash from a log line (skipping graph chars)."
@@ -1316,9 +1332,7 @@
 # ════════════════════════════════════════════════════════════════════
 
 (def diff-keymap (keymap/new))
-(keymap/bind diff-keymap "q" (fn [] (quit-git-buffer)))
-(keymap/bind diff-keymap "n" (fn [] (do-next-section)))
-(keymap/bind diff-keymap "p" (fn [] (do-prev-section)))
+
 
 (set diff-mode
   @{:name "git-diff"
@@ -1327,6 +1341,17 @@
     :grammar {:type :peg :highlights git-diff-peg}})
 
 (mode/register diff-mode)
+
+# Git buffers are special-purpose views, not text editing buffers.
+# Exclude them from vim-mode so git keybindings (like the y prefix)
+# aren't shadowed by vim operators.
+(package/after-load "jax/vim-mode"
+  (def vim (require "jax/vim-mode"))
+  (def exclude (get-in vim ['exclude-mode :value]))
+  (when exclude
+    (exclude "git-status")
+    (exclude "git-log")
+    (exclude "git-diff")))
 
 (set apply-diff-overlays
   (fn [b]
@@ -1360,25 +1385,6 @@
   (apply-diff-overlays b)
   (db/pop-to-buffer b (editor/get-state)
                     :actions [:reuse :same]))
-
-# ════════════════════════════════════════════════════════════════════
-# Shared helpers
-# ════════════════════════════════════════════════════════════════════
-
-(set quit-git-buffer
-  (fn []
-    (def state (editor/get-state))
-    (def p (pane))
-    (def prev (db/pane-previous-buffer p state))
-    (if prev
-      (put p :buffer prev)
-      (editor-message "No previous buffer"))))
-
-(set show-process-buffer
-  (fn []
-    (def b (git/get-process-buffer))
-    (db/pop-to-buffer b (editor/get-state)
-                      :actions [:reuse :split-below])))
 
 # ════════════════════════════════════════════════════════════════════
 # Transient menus
@@ -2757,19 +2763,198 @@
 
 # --- Bind transients to status keymap ---
 
-(keymap/bind status-keymap "c" (fn [] (transient/activate :git-commit)))
-(keymap/bind status-keymap "b" (fn [] (transient/activate :git-branch)))
-(keymap/bind status-keymap "P" (fn [] (transient/activate :git-push)))
-(keymap/bind status-keymap "F" (fn [] (transient/activate :git-pull)))
-(keymap/bind status-keymap "f" (fn [] (transient/activate :git-fetch)))
-(keymap/bind status-keymap "m" (fn [] (transient/activate :git-merge)))
-(keymap/bind status-keymap "r" (fn [] (transient/activate :git-rebase)))
-(keymap/bind status-keymap "A" (fn [] (transient/activate :git-cherry-pick)))
-(keymap/bind status-keymap "X" (fn [] (transient/activate :git-reset)))
-(keymap/bind status-keymap "t" (fn [] (transient/activate :git-tag)))
-(keymap/bind status-keymap "l" (fn [] (transient/activate :git-log)))
-(keymap/bind status-keymap "d" (fn [] (transient/activate :git-diff)))
-(keymap/bind status-keymap "z" (fn [] (transient/activate :git-stash)))
+(keymap/bind status-keymap "c" git-commit-transient)
+(keymap/bind status-keymap "b" git-branch-transient)
+(keymap/bind status-keymap "P" git-push-transient)
+(keymap/bind status-keymap "F" git-pull-transient)
+(keymap/bind status-keymap "f" git-fetch-transient)
+(keymap/bind status-keymap "m" git-merge-transient)
+(keymap/bind status-keymap "r" git-rebase-transient)
+(keymap/bind status-keymap "A" git-cherry-pick-transient)
+(keymap/bind status-keymap "X" git-reset-transient)
+(keymap/bind status-keymap "t" git-tag-transient)
+(keymap/bind status-keymap "l" git-log-transient)
+(keymap/bind status-keymap "d" git-diff-transient)
+(keymap/bind status-keymap "z" git-stash-transient)
+
+# --- Status keymap: navigation and operations ---
+
+(def status-g-map (keymap/new))
+(keymap/bind status-g-map "r" git-refresh)
+(keymap/bind status-g-map "g" move/beginning-of-buffer)
+(keymap/bind status-keymap "g" status-g-map)
+(keymap/bind status-keymap "G" move/end-of-buffer)
+(keymap/bind status-keymap "n" git-next-section)
+(keymap/bind status-keymap "p" git-prev-section)
+(keymap/bind status-keymap "M-n" git-next-sibling)
+(keymap/bind status-keymap "M-p" git-prev-sibling)
+(keymap/bind status-keymap "^" git-section-parent)
+(keymap/bind status-keymap "tab" git-toggle-section)
+(keymap/bind status-keymap "s" git-stage)
+(keymap/bind status-keymap "u" git-unstage)
+(keymap/bind status-keymap "x" git-discard)
+(keymap/bind status-keymap "enter" git-visit)
+(keymap/bind status-keymap "q" git-quit)
+(keymap/bind status-keymap "$" git-show-process-buffer)
+(keymap/bind status-keymap "v" git-toggle-line-select)
+(keymap/bind status-keymap "V" git-toggle-line-select)
+(keymap/bind status-keymap "escape" git-clear-selection)
+(keymap/bind status-keymap "C-g" git-clear-selection)
+(keymap/bind status-keymap "j" git-next-line)
+(keymap/bind status-keymap "k" git-prev-line)
+(keymap/bind status-keymap "1" git-visibility-level-1)
+(keymap/bind status-keymap "2" git-visibility-level-2)
+(keymap/bind status-keymap "3" git-visibility-level-3)
+(keymap/bind status-keymap "4" git-visibility-level-4)
+
+# --- Log keymap bindings ---
+
+(keymap/bind log-keymap "enter" git-log-visit)
+(keymap/bind log-keymap "q" git-quit)
+(keymap/bind log-keymap "n" git-next-section)
+(keymap/bind log-keymap "p" git-prev-section)
+(keymap/bind log-keymap "j" git-next-line)
+(keymap/bind log-keymap "k" git-prev-line)
+(keymap/bind log-keymap "G" move/end-of-buffer)
+(def log-g-map (keymap/new))
+(keymap/bind log-g-map "g" move/beginning-of-buffer)
+(keymap/bind log-keymap "g" log-g-map)
+
+# --- Diff keymap bindings ---
+
+(keymap/bind diff-keymap "q" git-quit)
+(keymap/bind diff-keymap "n" git-next-section)
+(keymap/bind diff-keymap "p" git-prev-section)
+(keymap/bind diff-keymap "j" git-next-line)
+(keymap/bind diff-keymap "k" git-prev-line)
+(keymap/bind diff-keymap "G" move/end-of-buffer)
+(def diff-g-map (keymap/new))
+(keymap/bind diff-g-map "g" move/beginning-of-buffer)
+(keymap/bind diff-keymap "g" diff-g-map)
+
+# ════════════════════════════════════════════════════════════════════
+# Copy / yank commands
+# ════════════════════════════════════════════════════════════════════
+
+(defn- section-copy-value
+  "Return the copyable string value for the section at the current line.
+  For commits returns the full SHA (resolved via rev-parse), for files
+  the path, for stashes the stash ref."
+  []
+  (def b (buffer))
+  (def section (sec/section-at-line b (cursor-line)))
+  (unless section (break nil))
+  (def data (section :data))
+  (case (section :type)
+    :commit
+    (when-let [hash (data :hash)]
+      (use-buffer-root)
+      (def result (git/run "rev-parse" hash))
+      (if (= (result :exit) 0)
+        (string/trim (result :stdout))
+        hash))
+
+    :file
+    (data :path)
+
+    :stash
+    (data :ref)
+
+    # Section headers — return status key name
+    :section-header
+    (when-let [status (data :status)]
+      (string status))
+
+    nil))
+
+(command/defcmd git-copy-section-value
+  "Copy the value of the section at point to the kill ring.
+  For commits copies the full SHA, for files the path, for stashes
+  the stash ref."
+  :label "Copy Section Value"
+  []
+  (if-let [value (section-copy-value)]
+    (do
+      (kill-ring/push value)
+      (editor/message (string "Copied: " value)))
+    (editor/message "Nothing to copy at point.")))
+
+(command/defcmd git-copy-buffer-revision
+  "Copy the revision displayed in the current buffer to the kill ring.
+  In a diff buffer showing a commit, copies the full SHA. In a log
+  buffer, copies the revision of the commit at point."
+  :label "Copy Buffer Revision"
+  []
+  (def b (buffer))
+  (use-buffer-root)
+  # Try buffer-level revision first (diff buffers store this)
+  (def rev (get-in b [:locals :git-revision]))
+  (if rev
+    (do
+      (def result (git/run "rev-parse" rev))
+      (def full-rev (if (= (result :exit) 0)
+                      (string/trim (result :stdout))
+                      rev))
+      (kill-ring/push full-rev)
+      (editor/message (string "Copied: " full-rev)))
+    # Fall back to HEAD
+    (do
+      (def result (git/run "rev-parse" "HEAD"))
+      (if (= (result :exit) 0)
+        (let [full-rev (string/trim (result :stdout))]
+          (kill-ring/push full-rev)
+          (editor/message (string "Copied: " full-rev)))
+        (editor/message "No revision to copy.")))))
+
+(command/defcmd git-show-refs
+  "List branches and tags in a dedicated buffer."
+  :label "Show Refs"
+  []
+  (use-buffer-root)
+  (def root (dyn :git-root))
+  (def branch-result (git/run "branch" "-a" "--format=%(refname:short) %(objectname:short) %(subject)"))
+  (def tag-result (git/run "tag" "-n1" "--sort=-creatordate"))
+  (unless (= (branch-result :exit) 0)
+    (editor/message "Failed to list refs.")
+    (break))
+  (def lines @[])
+  (array/push lines "Branches:")
+  (each line (string/split "\n" (string/trim (branch-result :stdout)))
+    (when (> (length line) 0)
+      (array/push lines (string "  " line))))
+  (when (and (= (tag-result :exit) 0)
+             (> (length (string/trim (tag-result :stdout))) 0))
+    (array/push lines "")
+    (array/push lines "Tags:")
+    (each line (string/split "\n" (string/trim (tag-result :stdout)))
+      (when (> (length line) 0)
+        (array/push lines (string "  " line)))))
+  (def content (string/join lines "\n"))
+  (def b (editor/make-view-buffer "*git-refs*" content))
+  (put b :hide-gutter true)
+  (put-in b [:locals :git-root] root)
+  (put-in b [:locals :project-root] root)
+  (put-in b [:locals :default-directory] root)
+  (db/pop-to-buffer b (editor/get-state)
+                    :actions [:reuse :same]))
+
+(command/defcmd git-yank-whole-line
+  "Copy the current line to the kill ring."
+  :label "Yank Whole Line"
+  []
+  (def b (buffer))
+  (def [line _] (buf/line-col b (cursor)))
+  (def start (buf/line-byte-offset b (- line 1)))
+  (def end (buf/line-end-byte-offset b (- line 1)))
+  (when (and start end)
+    (def text (buf/slice b start end))
+    (kill-ring/push text)
+    (editor/message "Copied line")))
+
+# --- Copy keybindings (Emacs/Magit convention: C-w and M-w) ---
+(each km [status-keymap log-keymap diff-keymap]
+  (keymap/bind km "C-w" git-copy-section-value)
+  (keymap/bind km "M-w" git-copy-buffer-revision))
 
 # ════════════════════════════════════════════════════════════════════
 # Commands & global keybindings
@@ -2836,7 +3021,7 @@
   "Show the git process log buffer."
   :label "Git Process Buffer"
   []
-  (show-process-buffer))
+  (git-show-process-buffer))
 
 # --- Global keybindings ---
 
