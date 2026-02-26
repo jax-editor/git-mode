@@ -21,7 +21,7 @@
 (import jax/transient)
 (import jax/display-buffer :as db)
 (import jax/core :prefix "")
-(import jax/commands/movement :as move)
+(import jax/movement :as move)
 (import jax/undo :as undo)
 (import jax/kill-ring)
 (import jax/package)
