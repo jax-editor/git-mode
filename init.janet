@@ -974,7 +974,7 @@
         (def view-buf (editor/make-view-buffer buf-name (result :stdout)))
         (put-in view-buf [:locals :git-root] root)
         (db/pop-to-buffer view-buf (editor/get-state)
-                          :actions [:reuse :split-below])
+                          :actions [:reuse :split-right])
         # Jump to the target line (0-indexed)
         (def target-line (- old-line 1))
         (when (> target-line 0)
@@ -1048,10 +1048,8 @@
   []
   (def state (editor/get-state))
   (def p (pane))
-  (def prev (db/pane-previous-buffer p state))
-  (if prev
-    (put p :buffer prev)
-    (editor-message "No previous buffer")))
+  (when p
+    (db/quit-window p state)))
 
 (command/defcmd git-show-process-buffer
   "Show the git process output buffer."
@@ -1245,7 +1243,7 @@
     (put-in b [:locals :default-directory] root)
     (put-in b [:locals :git-revision] hash)
     (db/pop-to-buffer b (editor/get-state)
-                      :actions [:reuse :split-below])
+                      :actions [:reuse :split-right])
     (apply-diff-overlays b))))
 
 (command/defcmd git-log-visit
@@ -2795,7 +2793,7 @@
 (keymap/bind status-keymap "x" git-discard)
 (keymap/bind status-keymap "enter" git-visit)
 (keymap/bind status-keymap "q" git-quit)
-(keymap/bind status-keymap "$" git-show-process-buffer)
+(keymap/bind status-keymap "`" git-show-process-buffer)
 (keymap/bind status-keymap "v" git-toggle-line-select)
 (keymap/bind status-keymap "V" git-toggle-line-select)
 (keymap/bind status-keymap "escape" git-clear-selection)

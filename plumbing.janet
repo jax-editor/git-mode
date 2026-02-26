@@ -5,6 +5,7 @@
 
 (import jax/buffer :as buf)
 (import jax/editor :as editor)
+(import jax/display-buffer :as db)
 (import jax/mode)
 (import jax/keymap)
 (import jax/command)
@@ -38,9 +39,12 @@
 
 (def process-keymap (keymap/new))
 (command/defcmd git-process-quit
-  "Show message about switching buffers."
+  "Quit the git process buffer window."
   :label "Process Quit" []
-  (editor/message "Use C-x b to switch buffers"))
+  (def state (editor/get-state))
+  (def p (state :current-pane))
+  (when p
+    (db/quit-window p state)))
 (keymap/bind process-keymap "q" git-process-quit)
 
 (def process-mode
