@@ -282,6 +282,8 @@
         unpulled-data (or (results :unpulled) @[])
         # Read view state from buffer locals
         expanded-files (or (get-in b [:locals :expanded-files]) @{})
+        expanded-commits (or (get-in b [:locals :expanded-commits]) @{})
+        commit-diffs (or (get-in b [:locals :commit-diffs]) @{})
         collapsed-sections (or (get-in b [:locals :collapsed-sections]) @{})
         # Save cursor position for restoration
         saved-cursor (or (get-in b [:locals :saved-cursor]) 0)]
@@ -432,6 +434,41 @@
   (render-section :staged "Staged changes" staged
                   :git-staged diff-staged)
 
+  # Helper to render inline commit diff lines for an expanded commit
+  (defn add-commit-diff-lines [hash commit-section]
+    (def cached-diff (commit-diffs hash))
+    (unless cached-diff (break))
+    (def file-children @[])
+    (each file-diff cached-diff
+      (def file-start (length lines))
+      (add-line (string "    " (or (file-diff :header) (string "diff " (file-diff :file))))
+                :git-diff-file-header)
+      (def hunk-children @[])
+      (each hunk (file-diff :hunks)
+        (def hunk-start (length lines))
+        (add-line (string "    " (hunk :header)) :git-diff-hunk-header)
+        (each line (hunk :lines)
+          (def face
+            (cond
+              (string/has-prefix? "+" line) :git-diff-add
+              (string/has-prefix? "-" line) :git-diff-remove
+              nil))
+          (add-line (string "    " line) face))
+        (def hunk-end (- (length lines) 1))
+        (array/push hunk-children
+          (sec/make-section :hunk hunk-start hunk-end
+                            :data @{:hunk hunk :file-diff file-diff}
+                            :face :git-diff-hunk-header)))
+      (def file-end (- (length lines) 1))
+      (array/push file-children
+        (sec/make-section :file file-start file-end
+                          :data @{:path (file-diff :file)
+                                  :commit-diff true}
+                          :children hunk-children
+                          :face :git-diff-file-header)))
+    (put commit-section :children file-children)
+    (put commit-section :end (- (length lines) 1)))
+
   # Helper to render a commit list section
   (defn render-commit-section [section-key heading commits]
     (when (> (length commits) 0)
@@ -447,10 +484,14 @@
                              (commit :date) "  "
                              (commit :subject) refs-str)
                       :git-hash))
-          (array/push children
+          (def commit-section
             (sec/make-section :commit commit-line commit-line
                               :data commit
-                              :face :git-hash))))
+                              :face :git-hash))
+          # Render inline diff if this commit is expanded
+          (when (expanded-commits (commit :hash))
+            (add-commit-diff-lines (commit :hash) commit-section))
+          (array/push children commit-section)))
       (def section-end (- (length lines) 1))
       (array/push sections
         (sec/make-section :section-header section-start section-end
@@ -691,6 +732,29 @@
             (put collapsed-sections status-key nil)
             (put collapsed-sections status-key true))
           (put-in b [:locals :collapsed-sections] collapsed-sections)
+          (re-render-status b)))
+
+      # Commit sections toggle inline diff expansion
+      :commit
+      (let [hash (get-in section [:data :hash])]
+        (when hash
+          (def expanded-commits
+            (or (get-in b [:locals :expanded-commits]) @{}))
+          (def commit-diffs
+            (or (get-in b [:locals :commit-diffs]) @{}))
+          (if (expanded-commits hash)
+            (put expanded-commits hash nil)
+            (do
+              (put expanded-commits hash true)
+              # Fetch and cache the commit diff if not already cached
+              (unless (commit-diffs hash)
+                (use-buffer-root)
+                (def result (git/run "show" "--format=" hash))
+                (when (= (result :exit) 0)
+                  (put commit-diffs hash
+                       (git/parse-diff (result :stdout)))))))
+          (put-in b [:locals :expanded-commits] expanded-commits)
+          (put-in b [:locals :commit-diffs] commit-diffs)
           (re-render-status b)))
 
       # Hunk sections — toggle parent file
@@ -1351,6 +1415,7 @@
   (when exclude
     (exclude "git-status")))
 
+
 (set apply-diff-overlays
   (fn [b]
     # Diff mode uses PEG grammar for highlighting now.
@@ -1461,6 +1526,7 @@
        (when (= (result :exit) 0)
          (ev/spawn
            (setdyn :git-root root)
+           (setdyn :git-no-editor true)
            (def rb (git/run "rebase" "-i" "--autosquash" (string hash "~1")))
            (if (= (rb :exit) 0)
              (do (editor-message "Fixup applied.")
@@ -1818,6 +1884,7 @@
   (editor-message (string desc "..."))
   (ev/spawn
     (setdyn :git-root root)
+    (setdyn :git-no-editor true)
     (def result (git/run ;args))
     (if (= (result :exit) 0)
       (do (editor-message (string desc " done."))
@@ -2308,6 +2375,7 @@
        (when (targs "--squash") (array/push args "--squash"))
        (when (targs "--no-commit") (array/push args "--no-commit"))
        (array/push args (candidate :text))
+       (setdyn :git-no-editor true)
        (def result (git/run ;args))
        (if (= (result :exit) 0)
          (do (editor-message (string "Merged " (candidate :text)))
@@ -2353,15 +2421,20 @@
   (when (targs "--interactive") (array/push args "--interactive"))
   (when (targs "--autosquash") (array/push args "--autosquash"))
   (def root (dyn :git-root))
-  (editor-message "Rebasing...")
+  (editor/message "Rebasing...")
   (ev/spawn
-    (setdyn :git-root root)
-    (def result (git/run ;args))
-    (if (= (result :exit) 0)
-      (do (editor-message "Rebase done.")
-          (hook/fire :git-post-operation :rebase args 0)
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Rebase failed: " (result :stderr))))))
+    (try
+      (do
+        (setdyn :git-root root)
+        (setdyn :git-no-editor true)
+        (def result (git/run ;args))
+        (if (= (result :exit) 0)
+          (do (editor/message "Rebase done.")
+              (hook/fire :git-post-operation :rebase args 0)
+              (when status-buf (do-status-refresh status-buf)))
+          (editor/message (string "Rebase failed: " (result :stderr)))))
+      ([err]
+        (editor/message (string "Rebase error: " err))))))
 
 (command/defcmd git-rebase-onto
   "Rebase onto a specific branch or commit."
@@ -2382,15 +2455,20 @@
        (when (targs "--autosquash") (array/push args "--autosquash"))
        (array/push args (candidate :text))
        (def root (dyn :git-root))
-       (editor-message (string "Rebasing onto " (candidate :text) "..."))
+       (editor/message (string "Rebasing onto " (candidate :text) "..."))
        (ev/spawn
-         (setdyn :git-root root)
-         (def result (git/run ;args))
-         (if (= (result :exit) 0)
-           (do (editor-message "Rebase done.")
-               (hook/fire :git-post-operation :rebase args 0)
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Rebase failed: " (result :stderr))))))}))
+         (try
+           (do
+             (setdyn :git-root root)
+             (setdyn :git-no-editor true)
+             (def result (git/run ;args))
+             (if (= (result :exit) 0)
+               (do (editor/message "Rebase done.")
+                   (hook/fire :git-post-operation :rebase args 0)
+                   (when status-buf (do-status-refresh status-buf)))
+               (editor/message (string "Rebase failed: " (result :stderr)))))
+           ([err]
+             (editor/message (string "Rebase error: " err))))))}))
 
 (command/defcmd git-rebase-interactive
   "Interactive rebase from a commit."
@@ -2407,42 +2485,69 @@
        (when (targs "--autostash") (array/push args "--autostash"))
        (when (targs "--autosquash") (array/push args "--autosquash"))
        (array/push args rev)
-       (editor-message "Starting interactive rebase...")
+       (editor/message "Starting interactive rebase...")
        (ev/spawn
-         (setdyn :git-root root)
-         (def result (git/run ;args))
-         (if (= (result :exit) 0)
-           (do (editor-message "Rebase done.")
-               (when status-buf (do-status-refresh status-buf)))
-           (editor-message (string "Rebase failed: " (result :stderr))))))}))
+         (try
+           (do
+             (setdyn :git-root root)
+             (setdyn :git-no-editor true)
+             (def result (git/run ;args))
+             (if (= (result :exit) 0)
+               (do (editor/message "Rebase done.")
+                   (when status-buf (do-status-refresh status-buf)))
+               (editor/message (string "Rebase failed: " (result :stderr)))))
+           ([err]
+             (editor/message (string "Rebase error: " err))))))}))
 
 (command/defcmd git-rebase-continue
   "Continue an in-progress rebase."
   :label "Rebase continue"
   []
   (use-buffer-root)
-  (def root (dyn :git-root))
+  (def root (or (dyn :git-root)
+                (get-in (buffer) [:locals :git-root])
+                (git/repo-root)))
+  (unless root
+    (editor/message "Cannot continue rebase: not in a git repository.")
+    (break))
+  (editor/message "Continuing rebase...")
   (ev/spawn
-    (setdyn :git-root root)
-    (def result (git/run "rebase" "--continue"))
-    (if (= (result :exit) 0)
-      (do (editor-message "Rebase continued.")
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Continue failed: " (result :stderr))))))
+    (try
+      (do
+        (setdyn :git-root root)
+        (setdyn :git-no-editor true)
+        (def result (git/run "rebase" "--continue"))
+        (if (= (result :exit) 0)
+          (do (editor/message "Rebase continued.")
+              (when status-buf (do-status-refresh status-buf)))
+          (editor/message (string "Continue failed: " (result :stderr)))))
+      ([err]
+        (editor/message (string "Rebase error: " err))))))
 
 (command/defcmd git-rebase-skip
   "Skip the current rebase step."
   :label "Rebase skip"
   []
   (use-buffer-root)
-  (def root (dyn :git-root))
+  (def root (or (dyn :git-root)
+                (get-in (buffer) [:locals :git-root])
+                (git/repo-root)))
+  (unless root
+    (editor/message "Cannot skip: not in a git repository.")
+    (break))
+  (editor/message "Skipping rebase step...")
   (ev/spawn
-    (setdyn :git-root root)
-    (def result (git/run "rebase" "--skip"))
-    (if (= (result :exit) 0)
-      (do (editor-message "Skipped.")
-          (when status-buf (do-status-refresh status-buf)))
-      (editor-message (string "Skip failed: " (result :stderr))))))
+    (try
+      (do
+        (setdyn :git-root root)
+        (setdyn :git-no-editor true)
+        (def result (git/run "rebase" "--skip"))
+        (if (= (result :exit) 0)
+          (do (editor/message "Skipped.")
+              (when status-buf (do-status-refresh status-buf)))
+          (editor/message (string "Skip failed: " (result :stderr)))))
+      ([err]
+        (editor/message (string "Skip error: " err))))))
 
 (command/defcmd git-rebase-abort
   "Abort the in-progress rebase."
@@ -2504,6 +2609,7 @@
   :label "Cherry-pick continue"
   []
   (use-buffer-root)
+  (setdyn :git-no-editor true)
   (def result (git/run "cherry-pick" "--continue"))
   (if (= (result :exit) 0)
     (do (editor-message "Cherry-pick continued.")
@@ -2793,6 +2899,7 @@
 (keymap/bind status-keymap "x" git-discard)
 (keymap/bind status-keymap "enter" git-visit)
 (keymap/bind status-keymap "q" git-quit)
+(keymap/bind status-keymap "$" git-show-process-buffer)
 (keymap/bind status-keymap "`" git-show-process-buffer)
 (keymap/bind status-keymap "v" git-toggle-line-select)
 (keymap/bind status-keymap "V" git-toggle-line-select)
@@ -2817,6 +2924,7 @@
 (def log-g-map (keymap/new))
 (keymap/bind log-g-map "g" move/beginning-of-buffer)
 (keymap/bind log-keymap "g" log-g-map)
+(keymap/bind log-keymap "$" git-show-process-buffer)
 
 # --- Diff keymap bindings ---
 
@@ -2829,6 +2937,7 @@
 (def diff-g-map (keymap/new))
 (keymap/bind diff-g-map "g" move/beginning-of-buffer)
 (keymap/bind diff-keymap "g" diff-g-map)
+(keymap/bind diff-keymap "$" git-show-process-buffer)
 
 # ════════════════════════════════════════════════════════════════════
 # Copy / yank commands

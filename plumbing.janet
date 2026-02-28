@@ -61,8 +61,7 @@
     (set process-buf (buf/new "*git-process*"))
     (put process-buf :readonly true)
     (put process-buf :hide-gutter true)
-    (put process-buf :major-mode process-mode)
-    (editor/add-buffer process-buf))
+    (mode/activate-major process-buf process-mode))
   process-buf)
 
 (defn- append-to-process-buffer
@@ -217,24 +216,47 @@
   (def result @{:exit -1 :stdout "" :stderr ""})
   (try
     (do
-      (def p (os/spawn (git-cmd args) :p {:out :pipe :err :pipe}))
-      (def stdout (or (:read (p :out) :all) ""))
-      (def stderr (or (:read (p :err) :all) ""))
+      # When :git-no-editor is set, pass a custom environment with
+      # GIT_EDITOR and GIT_SEQUENCE_EDITOR set to suppress editor
+      # prompts. Janet's os/spawn requires the :e flag and env vars
+      # mixed into the same table as :in/:out/:err redirects.
+      (def [spawn-flags spawn-opts]
+        (if (dyn :git-no-editor)
+          (let [env (merge (os/environ)
+                           {"GIT_EDITOR" "/usr/bin/true"
+                            "GIT_SEQUENCE_EDITOR" "/usr/bin/true"})]
+            (put env :in :pipe)
+            (put env :out :pipe)
+            (put env :err :pipe)
+            [:pe env])
+          [:p {:in :pipe :out :pipe :err :pipe}]))
+      (def p (os/spawn (git-cmd args) spawn-flags spawn-opts))
+      (:close (p :in))
+      # Read stdout and stderr concurrently to avoid pipe deadlock.
+      # If the process writes enough to fill one pipe's buffer while
+      # we're blocked reading the other, both sides would stall.
+      (def stdout-ch (ev/chan))
+      (def stderr-ch (ev/chan))
+      (ev/go (fn [] (ev/give stdout-ch (or (:read (p :out) :all) ""))))
+      (ev/go (fn [] (ev/give stderr-ch (or (:read (p :err) :all) ""))))
+      (def stdout (ev/take stdout-ch))
+      (def stderr (ev/take stderr-ch))
       (def exit (:wait p))
       (def elapsed (- (os/clock) start-time))
       (put result :exit exit)
       (put result :stdout (string stdout))
       (put result :stderr (string stderr))
       (put result :elapsed elapsed)
-      # Log to process buffer
+      # Log to process buffer — only show output on failure (like Magit)
       (def status-str (if (= exit 0) "ok" (string "exit " exit)))
       (def elapsed-str (string/format "%.3fs" elapsed))
       (append-to-process-buffer
         (string "$ git " (string/join (map string args) " ")
                 "  [" elapsed-str ", " status-str "]\n"
-                (when (> (length (string stdout)) 0) (string stdout))
-                (when (and (> (length (string stderr)) 0) (not= exit 0))
-                  (string stderr))
+                (when (not= exit 0)
+                  (string
+                    (when (> (length (string stdout)) 0) (string stdout))
+                    (when (> (length (string stderr)) 0) (string stderr))))
                 "\n")))
     ([err]
       (put result :stderr (string err))
@@ -255,8 +277,12 @@
       (def p (os/spawn (git-cmd args) :p {:in :pipe :out :pipe :err :pipe}))
       (:write (p :in) input)
       (:close (p :in))
-      (def stdout (or (:read (p :out) :all) ""))
-      (def stderr (or (:read (p :err) :all) ""))
+      (def stdout-ch (ev/chan))
+      (def stderr-ch (ev/chan))
+      (ev/go (fn [] (ev/give stdout-ch (or (:read (p :out) :all) ""))))
+      (ev/go (fn [] (ev/give stderr-ch (or (:read (p :err) :all) ""))))
+      (def stdout (ev/take stdout-ch))
+      (def stderr (ev/take stderr-ch))
       (def exit (:wait p))
       (def elapsed (- (os/clock) start-time))
       (put result :exit exit)
