@@ -12,6 +12,7 @@
 (import jax/faces)
 (import jax/hook)
 (import jax/core :prefix "")
+(import jax/process)
 
 # --- Faces ---
 
@@ -90,11 +91,7 @@
   (when (nil? git-available)
     (set git-available
       (try
-        (do
-          (def p (os/spawn ["git" "--version"] :p {:out :pipe :err :pipe}))
-          (:read (p :out) :all)
-          (:read (p :err) :all)
-          (= (:wait p) 0))
+        (= 0 ((process/run ["git" "--version"]) :exit-code))
         ([_] false))))
   git-available)
 
@@ -112,12 +109,9 @@
   []
   (unless (git-available?) (break nil))
   (try
-    (do
-      (def p (os/spawn (git-cmd ["rev-parse" "--show-toplevel"]) :p
-                       {:out :pipe :err :pipe}))
-      (def out (string/trim (or (:read (p :out) :all) "")))
-      (:read (p :err) :all)
-      (if (= (:wait p) 0) out nil))
+    (let [result (process/run (git-cmd ["rev-parse" "--show-toplevel"]))]
+      (when (= 0 (result :exit-code))
+        (string/trim (result :out))))
     ([_] nil)))
 
 (defn in-repo?
@@ -132,12 +126,19 @@
   "Return the current branch name, or nil if detached HEAD."
   []
   (try
-    (do
-      (def p (os/spawn (git-cmd ["symbolic-ref" "--short" "HEAD"]) :p
-                       {:out :pipe :err :pipe}))
-      (def out (string/trim (or (:read (p :out) :all) "")))
-      (:read (p :err) :all)
-      (if (= (:wait p) 0) out nil))
+    (let [result (process/run (git-cmd ["symbolic-ref" "--short" "HEAD"]))]
+      (when (= 0 (result :exit-code))
+        (string/trim (result :out))))
+    ([_] nil)))
+
+(defn- git-config-get
+  "Get a git config value, or nil if not set."
+  [key]
+  (try
+    (let [result (process/run (git-cmd ["config" "--get" key]))]
+      (when (= 0 (result :exit-code))
+        (def val (string/trim (result :out)))
+        (when (> (length val) 0) val)))
     ([_] nil)))
 
 (defn upstream-ref
@@ -146,27 +147,13 @@
   [&opt branch]
   (def br (or branch (current-branch)))
   (unless br (break nil))
-  (try
-    (do
-      (def p (os/spawn (git-cmd ["config" "--get"
-                                 (string "branch." br ".remote")]) :p
-                       {:out :pipe :err :pipe}))
-      (def remote (string/trim (or (:read (p :out) :all) "")))
-      (:read (p :err) :all)
-      (unless (= (:wait p) 0) (break nil))
-      (def p2 (os/spawn (git-cmd ["config" "--get"
-                                  (string "branch." br ".merge")]) :p
-                        {:out :pipe :err :pipe}))
-      (def merge-ref (string/trim (or (:read (p2 :out) :all) "")))
-      (:read (p2 :err) :all)
-      (unless (= (:wait p2) 0) (break nil))
-      # Convert refs/heads/main -> main
-      (def short-ref
-        (if (string/has-prefix? "refs/heads/" merge-ref)
-          (string/slice merge-ref 11)
-          merge-ref))
-      (string remote "/" short-ref))
-    ([_] nil)))
+  (when-let [remote (git-config-get (string "branch." br ".remote"))
+             merge-ref (git-config-get (string "branch." br ".merge"))]
+    (def short-ref
+      (if (string/has-prefix? "refs/heads/" merge-ref)
+        (string/slice merge-ref 11)
+        merge-ref))
+    (string remote "/" short-ref)))
 
 (defn push-remote-ref
   "Return the push remote ref for a branch, or nil.
@@ -175,37 +162,12 @@
   [&opt branch]
   (def br (or branch (current-branch)))
   (unless br (break nil))
-  (try
-    (do
-      # Check branch.<name>.pushRemote first
-      (def p (os/spawn (git-cmd ["config" "--get"
-                                 (string "branch." br ".pushRemote")]) :p
-                       {:out :pipe :err :pipe}))
-      (def push-remote (string/trim (or (:read (p :out) :all) "")))
-      (:read (p :err) :all)
-      (def remote
-        (if (and (= (:wait p) 0) (> (length push-remote) 0))
-          push-remote
-          # Fall back to remote.pushDefault
-          (do
-            (def p2 (os/spawn (git-cmd ["config" "--get"
-                                        "remote.pushDefault"]) :p
-                              {:out :pipe :err :pipe}))
-            (def pd (string/trim (or (:read (p2 :out) :all) "")))
-            (:read (p2 :err) :all)
-            (if (and (= (:wait p2) 0) (> (length pd) 0))
-              pd
-              # Fall back to upstream remote
-              (do
-                (def p3 (os/spawn (git-cmd ["config" "--get"
-                                            (string "branch." br ".remote")]) :p
-                                  {:out :pipe :err :pipe}))
-                (def r (string/trim (or (:read (p3 :out) :all) "")))
-                (:read (p3 :err) :all)
-                (when (= (:wait p3) 0) r))))))
-      (when (and remote (> (length remote) 0))
-        (string remote "/" br)))
-    ([_] nil)))
+  (def remote
+    (or (git-config-get (string "branch." br ".pushRemote"))
+        (git-config-get "remote.pushDefault")
+        (git-config-get (string "branch." br ".remote"))))
+  (when (and remote (> (length remote) 0))
+    (string remote "/" br)))
 
 (defn run
   "Run a git command, log to the process buffer, return
@@ -216,47 +178,29 @@
   (def result @{:exit -1 :stdout "" :stderr ""})
   (try
     (do
-      # When :git-no-editor is set, pass a custom environment with
-      # GIT_EDITOR and GIT_SEQUENCE_EDITOR set to suppress editor
-      # prompts. Janet's os/spawn requires the :e flag and env vars
-      # mixed into the same table as :in/:out/:err redirects.
-      (def [spawn-flags spawn-opts]
-        (if (dyn :git-no-editor)
-          (let [env (merge (os/environ)
-                           {"GIT_EDITOR" "/usr/bin/true"
-                            "GIT_SEQUENCE_EDITOR" "/usr/bin/true"})]
-            (put env :in :pipe)
-            (put env :out :pipe)
-            (put env :err :pipe)
-            [:pe env])
-          [:p {:in :pipe :out :pipe :err :pipe}]))
-      (def p (os/spawn (git-cmd args) spawn-flags spawn-opts))
-      (:close (p :in))
-      # Read stdout and stderr concurrently to avoid pipe deadlock.
-      # If the process writes enough to fill one pipe's buffer while
-      # we're blocked reading the other, both sides would stall.
-      (def stdout-ch (ev/chan))
-      (def stderr-ch (ev/chan))
-      (ev/go (fn [] (ev/give stdout-ch (or (:read (p :out) :all) ""))))
-      (ev/go (fn [] (ev/give stderr-ch (or (:read (p :err) :all) ""))))
-      (def stdout (ev/take stdout-ch))
-      (def stderr (ev/take stderr-ch))
-      (def exit (:wait p))
+      (def env
+        (when (dyn :git-no-editor)
+          {"GIT_EDITOR" "/usr/bin/true"
+           "GIT_SEQUENCE_EDITOR" "/usr/bin/true"}))
+      (def r (process/run (git-cmd args)
+               :name (string "git " (string/join (map string args) " "))
+               :env env))
       (def elapsed (- (os/clock) start-time))
-      (put result :exit exit)
-      (put result :stdout (string stdout))
-      (put result :stderr (string stderr))
+      (put result :exit (r :exit-code))
+      (put result :stdout (r :out))
+      (put result :stderr (r :err))
       (put result :elapsed elapsed)
       # Log to process buffer — only show output on failure (like Magit)
-      (def status-str (if (= exit 0) "ok" (string "exit " exit)))
+      (def status-str (if (= (r :exit-code) 0) "ok"
+                        (string "exit " (r :exit-code))))
       (def elapsed-str (string/format "%.3fs" elapsed))
       (append-to-process-buffer
         (string "$ git " (string/join (map string args) " ")
                 "  [" elapsed-str ", " status-str "]\n"
-                (when (not= exit 0)
+                (when (not= (r :exit-code) 0)
                   (string
-                    (when (> (length (string stdout)) 0) (string stdout))
-                    (when (> (length (string stderr)) 0) (string stderr))))
+                    (when (> (length (r :out)) 0) (r :out))
+                    (when (> (length (r :err)) 0) (r :err))))
                 "\n")))
     ([err]
       (put result :stderr (string err))
@@ -274,28 +218,22 @@
   (def result @{:exit -1 :stdout "" :stderr ""})
   (try
     (do
-      (def p (os/spawn (git-cmd args) :p {:in :pipe :out :pipe :err :pipe}))
-      (:write (p :in) input)
-      (:close (p :in))
-      (def stdout-ch (ev/chan))
-      (def stderr-ch (ev/chan))
-      (ev/go (fn [] (ev/give stdout-ch (or (:read (p :out) :all) ""))))
-      (ev/go (fn [] (ev/give stderr-ch (or (:read (p :err) :all) ""))))
-      (def stdout (ev/take stdout-ch))
-      (def stderr (ev/take stderr-ch))
-      (def exit (:wait p))
+      (def r (process/run (git-cmd args)
+               :name (string "git " (string/join (map string args) " "))
+               :in input))
       (def elapsed (- (os/clock) start-time))
-      (put result :exit exit)
-      (put result :stdout (string stdout))
-      (put result :stderr (string stderr))
+      (put result :exit (r :exit-code))
+      (put result :stdout (r :out))
+      (put result :stderr (r :err))
       (put result :elapsed elapsed)
-      (def status-str (if (= exit 0) "ok" (string "exit " exit)))
+      (def status-str (if (= (r :exit-code) 0) "ok"
+                        (string "exit " (r :exit-code))))
       (def elapsed-str (string/format "%.3fs" elapsed))
       (append-to-process-buffer
         (string "$ git " (string/join (map string args) " ")
                 " <<stdin  [" elapsed-str ", " status-str "]\n"
-                (when (and (> (length (string stderr)) 0) (not= exit 0))
-                  (string stderr))
+                (when (and (> (length (r :err)) 0) (not= (r :exit-code) 0))
+                  (r :err))
                 "\n")))
     ([err]
       (put result :stderr (string err))
