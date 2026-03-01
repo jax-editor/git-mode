@@ -15,7 +15,7 @@
 (import jax/keymap)
 (import jax/mode)
 (import jax/faces)
-(import jax/overlay)
+(import jax/virtual-buffer :as vb)
 (import jax/pane)
 (import jax/prompt)
 (import jax/transient)
@@ -25,6 +25,7 @@
 (import jax/undo :as undo)
 (import jax/kill-ring)
 (import jax/package)
+(import jax/overlay)
 
 (import ./plumbing :as git)
 (import ./sections :as sec)
@@ -141,11 +142,11 @@
 (var apply-diff-overlays nil)
 (var diff-mode nil)
 
-# --- Status mode keymap ---
+# --- Status mode keymap (inherits VB navigation: j/k/gg/G/C-f/C-b/q/?) ---
 
-(def status-keymap (keymap/new))
+(def status-keymap (keymap/new vb/virtual-buffer-keymap))
 
-# --- Cursor helpers (needed early by line selection and navigation) ---
+# --- Cursor helpers ---
 
 (defn- cursor-line []
   (def b (buffer))
@@ -244,11 +245,21 @@
 (def status-mode
   @{:name "git-status"
     :display-name "Git Status"
-    :keymap status-keymap})
+    :category :special
+    :keymap status-keymap
+    :suppress-self-insert true})
 
 (mode/register status-mode)
 
-# --- Rendering ---
+# ════════════════════════════════════════════════════════════════════
+# Status buffer rendering — Virtual buffer model
+# ════════════════════════════════════════════════════════════════════
+#
+# The status buffer is a flat list of items, each representing one
+# line. Item types: :header, :blank, :section-heading, :file,
+# :hunk-header, :diff-line, :commit, :commit-file-header, :stash.
+# Items carry rich metadata for operations (stage, visit, etc.).
+# String IDs ensure value-based identity for cursor restoration.
 
 (defn- status-line-xy-to-label
   "Convert a porcelain v2 XY code to a human-readable change type."
@@ -265,100 +276,100 @@
     (= worktree-char "D") "deleted"
     "changed"))
 
-(defn- render-status-buffer
-  "Render the status buffer from parsed git data.
-  Reads expanded/collapsed state from buffer locals to render inline
-  diffs and hide collapsed sections. This is the single rendering path —
-  both refresh and toggle operations call this."
+(defn- render-status-item
+  "Pure render function: convert a status item to a line spec."
+  [item]
+  (case (item :type)
+    :header
+    {:text (item :text) :face :git-header}
+
+    :blank
+    {:text ""}
+
+    :section-heading
+    {:text (string (item :heading) " (" (item :count) ")")
+     :face :git-section-heading}
+
+    :file
+    {:text (if (item :change-type)
+             (string "  " (item :change-type) "  " (item :path))
+             (string "  " (item :path)))
+     :face (case (item :status)
+             :untracked :git-untracked
+             :unstaged :git-unstaged
+             :staged :git-staged
+             nil)}
+
+    :hunk-header
+    {:text (string "    " (get-in item [:hunk :header]))
+     :face :git-diff-hunk-header}
+
+    :diff-line
+    (let [text (item :diff-text)]
+      {:text (string "    " text)
+       :face (cond
+               (string/has-prefix? "+" text) :git-diff-add
+               (string/has-prefix? "-" text) :git-diff-remove
+               nil)})
+
+    :commit
+    {:runs (filter truthy?
+             [(when (item :hash)
+                {:text (string "  " (item :hash) " ") :face :git-hash})
+              (when (item :date)
+                {:text (string (item :date) "  ") :face :git-date})
+              {:text (or (item :subject) "")}
+              (when (item :refs)
+                {:text (string " (" (item :refs) ")") :face :git-refs})])}
+
+    :commit-file-header
+    {:text (string "    " (item :header-text))
+     :face :git-diff-file-header}
+
+    :stash
+    {:text (string "  " (item :ref) " " (item :message))
+     :face :git-hash}
+
+    {:text ""}))
+
+(var- id-counter 0)
+(defn- next-id []
+  "Generate a unique separator/blank ID."
+  (++ id-counter)
+  (string "sep:" id-counter))
+
+(defn- build-status-items
+  "Build the flat items list from parsed git data.
+  Reads expansion/collapse state from buffer locals."
   [b results]
-  (let [status-data (results :status)
-        branch (status-data :branch)
-        entries (status-data :entries)
-        log-data (results :log)
-        stash-data (results :stash)
-        diff-unstaged (results :diff-unstaged)
-        diff-staged (results :diff-staged)
-        unpushed-data (or (results :unpushed) @[])
-        unpulled-data (or (results :unpulled) @[])
-        # Read view state from buffer locals
-        expanded-files (or (get-in b [:locals :expanded-files]) @{})
-        expanded-commits (or (get-in b [:locals :expanded-commits]) @{})
-        commit-diffs (or (get-in b [:locals :commit-diffs]) @{})
-        collapsed-sections (or (get-in b [:locals :collapsed-sections]) @{})
-        # Save cursor position for restoration
-        saved-cursor (or (get-in b [:locals :saved-cursor]) 0)]
+  (set id-counter 0)
+  (def status-data (results :status))
+  (def branch (status-data :branch))
+  (def entries (status-data :entries))
+  (def log-data (results :log))
+  (def stash-data (results :stash))
+  (def diff-unstaged (results :diff-unstaged))
+  (def diff-staged (results :diff-staged))
+  (def unpushed-data (or (results :unpushed) @[]))
+  (def unpulled-data (or (results :unpulled) @[]))
 
-  # Clear buffer
-  (put b :readonly false)
-  (unless (b :undo-root) (undo/init b))
-  (when (> (buf/length b) 0)
-    (buf/delete-forward b 0 (buf/length b)))
+  (def expanded-files (or (get-in b [:locals :expanded-files]) @{}))
+  (def expanded-commits (or (get-in b [:locals :expanded-commits]) @{}))
+  (def commit-diffs (or (get-in b [:locals :commit-diffs]) @{}))
+  (def collapsed-sections (or (get-in b [:locals :collapsed-sections]) @{}))
 
-  # Build content lines and sections
-  (def lines @[])
-  (def sections @[])
-  (def overlays-list @[])
-
-  # Helper to add a line and track position
-  (defn add-line [text &opt face]
-    (def line-num (length lines))
-    (array/push lines text)
-    (when face
-      (array/push overlays-list @{:line line-num :face face}))
-    line-num)
-
-  # Helper to render inline diff lines for an expanded file
-  (defn add-diff-lines [file-diff file-section]
-    (def hunk-children @[])
-    (each hunk (file-diff :hunks)
-      (def hunk-start (length lines))
-      (add-line (string "    " (hunk :header)) :git-diff-hunk-header)
-      (each line (hunk :lines)
-        (def face
-          (cond
-            (string/has-prefix? "+" line) :git-diff-add
-            (string/has-prefix? "-" line) :git-diff-remove
-            nil))
-        (add-line (string "    " line) face))
-      (def hunk-end (- (length lines) 1))
-      (array/push hunk-children
-        (sec/make-section :hunk hunk-start hunk-end
-                          :data @{:hunk hunk :file-diff file-diff}
-                          :face :git-diff-hunk-header)))
-    (put file-section :children hunk-children)
-    (put file-section :end (- (length lines) 1)))
-
-  # Helper to render a file section (with optional inline diff)
-  (defn add-file-section [entry change-type status-key face diff-data]
-    (def path (entry :path))
-    # Expansion key distinguishes staged vs unstaged for same file
-    (def expand-key (string (or status-key "") ":" path))
-    (def file-line (add-line (string "  " change-type "  " path) face))
-    (def file-section
-      (sec/make-section :file file-line file-line
-                        :data @{:path path
-                                :status status-key
-                                :entry entry
-                                :expand-key expand-key}
-                        :face face))
-    # Store diff data for future expansion
-    (when diff-data
-      (def file-diff (find |(= ($ :file) path) diff-data))
-      (when file-diff
-        (put-in file-section [:data :diff] file-diff)
-        # Render inline diff if this file is expanded
-        (when (expanded-files expand-key)
-          (add-diff-lines file-diff file-section))))
-    file-section)
+  (def items @[])
 
   # --- Header ---
   (def head-display (or (branch :head) "(detached)"))
   (def oid-short (if (branch :oid)
                    (string/slice (branch :oid) 0 (min 7 (length (branch :oid))))
                    ""))
-  (add-line (string "Head:     " head-display
-                    (when (> (length oid-short) 0) (string " (" oid-short ")")))
-            :git-header)
+  (array/push items
+    @{:id "head" :type :header
+      :text (string "Head:     " head-display
+                    (when (> (length oid-short) 0)
+                      (string " (" oid-short ")")))})
 
   (when (branch :upstream)
     (def ab-str
@@ -373,11 +384,13 @@
         (when (and (or (nil? (branch :ahead)) (= (branch :ahead) 0))
                    (or (nil? (branch :behind)) (= (branch :behind) 0)))
           "up to date")))
-    (add-line (string "Upstream: " (branch :upstream)
-                      (when (> (length ab-str) 0) (string " (" ab-str ")")))
-              :git-header))
+    (array/push items
+      @{:id "upstream" :type :header
+        :text (string "Upstream: " (branch :upstream)
+                      (when (> (length ab-str) 0)
+                        (string " (" ab-str ")")))}))
 
-  (add-line "")
+  (array/push items @{:id (next-id) :type :blank})
 
   # --- Categorize entries ---
   (def untracked @[])
@@ -392,15 +405,42 @@
         (when (entry :unstaged) (array/push unstaged entry))
         (when (entry :staged) (array/push staged entry)))))
 
-  # --- Render a group of entries as a collapsible section ---
-  (defn render-section [section-key heading-text items face diff-data]
-    (when (> (length items) 0)
-      (def section-start (length lines))
-      (add-line (string heading-text " (" (length items) ")")
-                :git-section-heading)
-      (def children @[])
+  # --- Helper: add diff lines for an expanded file ---
+  (defn add-diff-items [path status-key diff-data]
+    (when diff-data
+      (def file-diff (find |(= ($ :file) path) diff-data))
+      (when file-diff
+        (def expand-key (string status-key ":" path))
+        (when (expanded-files expand-key)
+          (for hi 0 (length (file-diff :hunks))
+            (def hunk ((file-diff :hunks) hi))
+            (array/push items
+              @{:id (string status-key ":" path ":hunk:" hi)
+                :type :hunk-header
+                :status status-key :path path
+                :hunk hunk :file-diff file-diff})
+            (for li 0 (length (hunk :lines))
+              (array/push items
+                @{:id (string status-key ":" path ":hunk:" hi ":line:" li)
+                  :type :diff-line
+                  :status status-key :path path
+                  :hunk hunk :file-diff file-diff
+                  :line-idx li
+                  :diff-text ((hunk :lines) li)})))))))
+
+  # --- Helper: add a section of file entries ---
+  (defn add-file-section [section-key heading-text file-entries face diff-data]
+    (when (> (length file-entries) 0)
+      (array/push items
+        @{:id (string "section:" section-key)
+          :type :section-heading
+          :status section-key
+          :heading heading-text
+          :count (length file-entries)})
+
       (unless (collapsed-sections section-key)
-        (each entry items
+        (each entry file-entries
+          (def path (entry :path))
           (def change-type
             (case section-key
               :untracked ""
@@ -408,179 +448,137 @@
               (if (= (entry :type) :unmerged) "unmerged"
                 (status-line-xy-to-label
                   (string "." (string/slice (entry :xy) 1 2))))))
-          (def file-section
-            (if (= section-key :untracked)
-              (do
-                (def file-line (add-line (string "  " (entry :path)) face))
-                (sec/make-section :file file-line file-line
-                                  :data @{:path (entry :path)
-                                          :status section-key}
-                                  :face face))
-              (add-file-section entry change-type section-key face diff-data)))
-          (array/push children file-section)))
-      (def section-end (- (length lines) 1))
-      (array/push sections
-        (sec/make-section :section-header section-start section-end
-                          :data @{:status section-key}
-                          :children children
-                          :collapsed (truthy? (collapsed-sections section-key))
-                          :face :git-section-heading))
-      (add-line "")))
 
-  (render-section :untracked "Untracked files" untracked
-                  :git-untracked nil)
-  (render-section :unstaged "Unstaged changes" unstaged
-                  :git-unstaged diff-unstaged)
-  (render-section :staged "Staged changes" staged
-                  :git-staged diff-staged)
+          (def expand-key (string section-key ":" path))
+          (def file-diff (when diff-data
+                           (find |(= ($ :file) path) diff-data)))
 
-  # Helper to render inline commit diff lines for an expanded commit
-  (defn add-commit-diff-lines [hash commit-section]
+          (array/push items
+            @{:id (string section-key ":" path)
+              :type :file
+              :status section-key :path path
+              :change-type change-type
+              :entry entry
+              :expand-key expand-key
+              :file-diff file-diff})
+
+          (add-diff-items path section-key diff-data)))
+
+      (array/push items @{:id (next-id) :type :blank})))
+
+  (add-file-section :untracked "Untracked files" untracked
+                    :git-untracked nil)
+  (add-file-section :unstaged "Unstaged changes" unstaged
+                    :git-unstaged diff-unstaged)
+  (add-file-section :staged "Staged changes" staged
+                    :git-staged diff-staged)
+
+  # --- Helper: add inline commit diff items ---
+  (defn add-commit-diff-items [hash]
     (def cached-diff (commit-diffs hash))
     (unless cached-diff (break))
-    (def file-children @[])
     (each file-diff cached-diff
-      (def file-start (length lines))
-      (add-line (string "    " (or (file-diff :header) (string "diff " (file-diff :file))))
-                :git-diff-file-header)
-      (def hunk-children @[])
-      (each hunk (file-diff :hunks)
-        (def hunk-start (length lines))
-        (add-line (string "    " (hunk :header)) :git-diff-hunk-header)
-        (each line (hunk :lines)
-          (def face
-            (cond
-              (string/has-prefix? "+" line) :git-diff-add
-              (string/has-prefix? "-" line) :git-diff-remove
-              nil))
-          (add-line (string "    " line) face))
-        (def hunk-end (- (length lines) 1))
-        (array/push hunk-children
-          (sec/make-section :hunk hunk-start hunk-end
-                            :data @{:hunk hunk :file-diff file-diff}
-                            :face :git-diff-hunk-header)))
-      (def file-end (- (length lines) 1))
-      (array/push file-children
-        (sec/make-section :file file-start file-end
-                          :data @{:path (file-diff :file)
-                                  :commit-diff true}
-                          :children hunk-children
-                          :face :git-diff-file-header)))
-    (put commit-section :children file-children)
-    (put commit-section :end (- (length lines) 1)))
+      (array/push items
+        @{:id (string "commit-diff:" hash ":" (or (file-diff :file) ""))
+          :type :commit-file-header
+          :header-text (or (file-diff :header)
+                           (string "diff " (file-diff :file)))})
+      (for hi 0 (length (file-diff :hunks))
+        (def hunk ((file-diff :hunks) hi))
+        (array/push items
+          @{:id (string "commit-diff:" hash ":" (or (file-diff :file) "") ":hunk:" hi)
+            :type :hunk-header
+            :status :commit :path (file-diff :file)
+            :hunk hunk :file-diff file-diff})
+        (for li 0 (length (hunk :lines))
+          (array/push items
+            @{:id (string "commit-diff:" hash ":" (or (file-diff :file) "") ":hunk:" hi ":line:" li)
+              :type :diff-line
+              :status :commit :path (file-diff :file)
+              :hunk hunk :file-diff file-diff
+              :line-idx li
+              :diff-text ((hunk :lines) li)})))))
 
-  # Helper to render a commit list section
-  (defn render-commit-section [section-key heading commits]
+  # --- Helper: add commit list section ---
+  (defn add-commit-section [section-key heading commits]
     (when (> (length commits) 0)
-      (def section-start (length lines))
-      (add-line (string heading " (" (length commits) ")")
-                :git-section-heading)
-      (def children @[])
+      (array/push items
+        @{:id (string "section:" section-key)
+          :type :section-heading
+          :status section-key
+          :heading heading
+          :count (length commits)})
+
       (unless (collapsed-sections section-key)
         (each commit commits
-          (def refs-str (if (commit :refs) (string " (" (commit :refs) ")") ""))
-          (def commit-line
-            (add-line (string "  " (commit :hash) " "
-                             (commit :date) "  "
-                             (commit :subject) refs-str)
-                      :git-hash))
-          (def commit-section
-            (sec/make-section :commit commit-line commit-line
-                              :data commit
-                              :face :git-hash))
-          # Render inline diff if this commit is expanded
+          (def refs-str (if (commit :refs) (commit :refs) nil))
+          (array/push items
+            @{:id (string section-key ":" (commit :hash))
+              :type :commit
+              :status section-key
+              :hash (commit :hash)
+              :date (commit :date)
+              :subject (commit :subject)
+              :refs refs-str
+              :commit-data commit})
+          # Inline diff if expanded
           (when (expanded-commits (commit :hash))
-            (add-commit-diff-lines (commit :hash) commit-section))
-          (array/push children commit-section)))
-      (def section-end (- (length lines) 1))
-      (array/push sections
-        (sec/make-section :section-header section-start section-end
-                          :data @{:status section-key}
-                          :children children
-                          :collapsed (truthy? (collapsed-sections section-key))
-                          :face :git-section-heading))
-      (add-line "")))
+            (add-commit-diff-items (commit :hash)))))
 
-  # --- Unpushed / Unpulled commits ---
-  (render-commit-section :unpushed
+      (array/push items @{:id (next-id) :type :blank})))
+
+  # --- Unpushed / Unpulled / Recent commits ---
+  (add-commit-section :unpushed
     (string "Unpushed to " (or (branch :upstream) "upstream"))
     unpushed-data)
-  (render-commit-section :unpulled
+  (add-commit-section :unpulled
     (string "Unpulled from " (or (branch :upstream) "upstream"))
     unpulled-data)
-
-  # --- Recent commits ---
-  (render-commit-section :log "Recent commits" log-data)
+  (add-commit-section :log "Recent commits" log-data)
 
   # --- Stashes ---
   (when (and stash-data (> (length stash-data) 0))
-    (def section-start (length lines))
-    (add-line (string "Stashes (" (length stash-data) ")")
-              :git-section-heading)
-    (def children @[])
+    (array/push items
+      @{:id "section:stash"
+        :type :section-heading
+        :status :stash
+        :heading "Stashes"
+        :count (length stash-data)})
+
     (unless (collapsed-sections :stash)
       (each stash stash-data
-        (def stash-line
-          (add-line (string "  " (stash :ref) " " (stash :message))
-                    :git-hash))
-        (array/push children
-          (sec/make-section :stash stash-line stash-line
-                            :data stash
-                            :face :git-hash))))
-    (def section-end (- (length lines) 1))
-    (array/push sections
-      (sec/make-section :section-header section-start section-end
-                        :data @{:status :stash}
-                        :children children
-                        :collapsed (truthy? (collapsed-sections :stash))
-                        :face :git-section-heading)))
+        (array/push items
+          @{:id (string "stash:" (stash :ref))
+            :type :stash
+            :status :stash
+            :ref (stash :ref)
+            :message (stash :message)
+            :stash-data stash}))))
 
-  # --- Write to buffer ---
-  (def content (string/join lines "\n"))
-  (when (> (length content) 0)
-    (buf/insert b 0 content))
-  (put b :readonly true)
-  (put b :modified false)
+  items)
 
-  # Store sections
-  (sec/build-section-tree b sections)
+(defn- status-pane
+  "Find the pane showing the given buffer, or nil."
+  [b]
+  (db/find-buffer-pane b (editor/get-state)))
 
-  # Store parsed data for staging operations
+(defn- render-status
+  "Render the status buffer from parsed git data.
+  Builds items and delegates to virtual-buffer."
+  [b results]
   (put-in b [:locals :git-data] results)
-
-  # Apply overlays for faces
-  (overlay/clear-overlays-by-tag b :git-face)
-  (overlay/clear-overlays-by-tag b :git-diff)
-  (each ov-info overlays-list
-    (def line (ov-info :line))
-    (def face (ov-info :face))
-    (def start (buf/line-byte-offset b line))
-    (def end (buf/line-end-byte-offset b line))
-    (def tag (if (or (= face :git-diff-add)
-                     (= face :git-diff-remove)
-                     (= face :git-diff-hunk-header))
-               :git-diff :git-face))
-    (overlay/add-overlay b
-      (overlay/make-overlay b start end face
-        {:tag tag :priority 10})))
-
-  # Restore cursor position (clamp to buffer length)
-  (def max-pos (max 0 (- (buf/length b) 1)))
-  (put-in b [:locals :saved-cursor] nil)
-  (when (> saved-cursor 0)
-    (set-cursor (min saved-cursor max-pos)))
-
+  (def items (build-status-items b results))
+  (vb/set-items b items (status-pane b))
   # Fire hook
-  (hook/fire :git-status-refreshed b)))
+  (hook/fire :git-status-refreshed b))
 
 (defn- re-render-status
   "Re-render the status buffer from cached git data.
-  Preserves cursor position. Used by toggle operations."
+  Virtual buffer handles cursor restoration automatically."
   [b]
   (def results (get-in b [:locals :git-data]))
   (unless results (break))
-  (put-in b [:locals :saved-cursor] (cursor))
-  (render-status-buffer b results))
+  (render-status b results))
 
 # --- Refresh ---
 
@@ -655,135 +653,215 @@
          @[]))
 
   # Render
-  (render-status-buffer b parsed)
+  (render-status b parsed)
 
   (set refresh-pending false))
 
-# --- Section navigation commands ---
+# ════════════════════════════════════════════════════════════════════
+# Item lookup helpers
+# ════════════════════════════════════════════════════════════════════
+
+(defn- current-item
+  "Get the VB item at cursor in the current buffer/pane."
+  []
+  (def b (buffer))
+  (def p (status-pane b))
+  (when p (vb/item-at-cursor b p)))
+
+# ════════════════════════════════════════════════════════════════════
+# Section navigation commands
+# ════════════════════════════════════════════════════════════════════
+
+(defn- pos-to-line
+  "Convert a buffer byte position to a 0-indexed line number."
+  [b pos]
+  (def [line _] (buf/line-col b pos))
+  (- line 1))
+
+(defn- next-section-heading-line
+  "Find line of the next :section-heading item after cursor."
+  [b p]
+  (def vbs (get-in b [:locals :vb]))
+  (unless vbs (break nil))
+  (def lm (vbs :line-map))
+  (def cur (pos-to-line b (p :cursor)))
+  (for i (+ cur 1) (length lm)
+    (when (= (get-in lm [i :item :type]) :section-heading)
+      (break i))))
+
+(defn- prev-section-heading-line
+  "Find line of the previous :section-heading item before cursor."
+  [b p]
+  (def vbs (get-in b [:locals :vb]))
+  (unless vbs (break nil))
+  (def lm (vbs :line-map))
+  (def cur (pos-to-line b (p :cursor)))
+  (var found nil)
+  (loop [i :down [(- cur 1) 0]]
+    (when (= (get-in lm [i :item :type]) :section-heading)
+      (set found i)
+      (break)))
+  found)
 
 (command/defcmd git-next-section
   "Move to the next section."
   :label "Next Section"
   []
   (def b (buffer))
-  (def line (sec/next-section-line b (cursor-line)))
-  (goto-line b line))
+  (def p (status-pane b))
+  (when p
+    (when-let [line (next-section-heading-line b p)]
+      (goto-line b line))))
 
 (command/defcmd git-prev-section
   "Move to the previous section."
   :label "Previous Section"
   []
   (def b (buffer))
-  (def line (sec/prev-section-line b (cursor-line)))
-  (goto-line b line))
+  (def p (status-pane b))
+  (when p
+    (when-let [line (prev-section-heading-line b p)]
+      (goto-line b line))))
 
 (command/defcmd git-next-sibling
-  "Move to the next sibling section."
+  "Move to the next sibling item (same type at same level)."
   :label "Next Sibling Section"
   []
   (def b (buffer))
-  (def line (sec/next-sibling-line b (cursor-line)))
-  (goto-line b line))
+  (def p (status-pane b))
+  (when p
+    (def item (vb/item-at-cursor b p))
+    (when item
+      (def vbs (get-in b [:locals :vb]))
+      (def lm (vbs :line-map))
+      (def cur (pos-to-line b (p :cursor)))
+      (def target-type (item :type))
+      (for i (+ cur 1) (length lm)
+        (def candidate (get-in lm [i :item]))
+        (when (= (candidate :type) target-type)
+          (goto-line b i)
+          (break))))))
 
 (command/defcmd git-prev-sibling
-  "Move to the previous sibling section."
+  "Move to the previous sibling item (same type at same level)."
   :label "Previous Sibling Section"
   []
   (def b (buffer))
-  (def line (sec/prev-sibling-line b (cursor-line)))
-  (goto-line b line))
+  (def p (status-pane b))
+  (when p
+    (def item (vb/item-at-cursor b p))
+    (when item
+      (def vbs (get-in b [:locals :vb]))
+      (def lm (vbs :line-map))
+      (def cur (pos-to-line b (p :cursor)))
+      (def target-type (item :type))
+      (var found nil)
+      (loop [i :down [(- cur 1) 0]]
+        (when (= (get-in lm [i :item :type]) target-type)
+          (set found i)
+          (break)))
+      (when found (goto-line b found)))))
 
 (command/defcmd git-section-parent
-  "Move to the parent section."
+  "Move to the parent section heading."
   :label "Section Parent"
   []
   (def b (buffer))
-  (def line (sec/parent-section-line b (cursor-line)))
-  (goto-line b line))
+  (def p (status-pane b))
+  (when p
+    (def item (vb/item-at-cursor b p))
+    (when (and item (not= (item :type) :section-heading))
+      # Find the section heading above us
+      (def vbs (get-in b [:locals :vb]))
+      (def lm (vbs :line-map))
+      (def cur (pos-to-line b (p :cursor)))
+      (loop [i :down [(- cur 1) 0]]
+        (when (= (get-in lm [i :item :type]) :section-heading)
+          (goto-line b i)
+          (break))))))
+
+# ════════════════════════════════════════════════════════════════════
+# Toggle section / file / commit expansion
+# ════════════════════════════════════════════════════════════════════
 
 (command/defcmd git-toggle-section
   "Toggle visibility of the section at point."
   :label "Toggle Section"
   []
   (def b (buffer))
-  (def line (cursor-line))
-  (def section (sec/section-at-line b line))
-  (when section
-    (def expanded-files
-      (or (get-in b [:locals :expanded-files]) @{}))
-    (def collapsed-sections
-      (or (get-in b [:locals :collapsed-sections]) @{}))
-    (case (section :type)
-      # File sections toggle inline diff expansion
-      :file
-      (let [expand-key (get-in section [:data :expand-key])]
-        (when expand-key
-          (if (expanded-files expand-key)
-            (put expanded-files expand-key nil)
-            (put expanded-files expand-key true))
-          (put-in b [:locals :expanded-files] expanded-files)
-          (re-render-status b)))
+  (def item (current-item))
+  (unless item (break))
 
-      # Section headers toggle collapse
-      :section-header
-      (let [status-key (get-in section [:data :status])]
-        (when status-key
-          (if (collapsed-sections status-key)
-            (put collapsed-sections status-key nil)
-            (put collapsed-sections status-key true))
-          (put-in b [:locals :collapsed-sections] collapsed-sections)
-          (re-render-status b)))
+  (case (item :type)
+    # File: toggle inline diff expansion
+    :file
+    (when-let [expand-key (item :expand-key)]
+      (def expanded-files
+        (or (get-in b [:locals :expanded-files]) @{}))
+      (if (expanded-files expand-key)
+        (put expanded-files expand-key nil)
+        (put expanded-files expand-key true))
+      (put-in b [:locals :expanded-files] expanded-files)
+      (re-render-status b))
 
-      # Commit sections toggle inline diff expansion
-      :commit
-      (let [hash (get-in section [:data :hash])]
-        (when hash
-          (def expanded-commits
-            (or (get-in b [:locals :expanded-commits]) @{}))
-          (def commit-diffs
-            (or (get-in b [:locals :commit-diffs]) @{}))
-          (if (expanded-commits hash)
-            (put expanded-commits hash nil)
-            (do
-              (put expanded-commits hash true)
-              # Fetch and cache the commit diff if not already cached
-              (unless (commit-diffs hash)
-                (use-buffer-root)
-                (def result (git/run "show" "--format=" hash))
-                (when (= (result :exit) 0)
-                  (put commit-diffs hash
-                       (git/parse-diff (result :stdout)))))))
-          (put-in b [:locals :expanded-commits] expanded-commits)
-          (put-in b [:locals :commit-diffs] commit-diffs)
-          (re-render-status b)))
+    # Section heading: toggle collapse
+    :section-heading
+    (when-let [status-key (item :status)]
+      (def collapsed-sections
+        (or (get-in b [:locals :collapsed-sections]) @{}))
+      (if (collapsed-sections status-key)
+        (put collapsed-sections status-key nil)
+        (put collapsed-sections status-key true))
+      (put-in b [:locals :collapsed-sections] collapsed-sections)
+      (re-render-status b))
 
-      # Hunk sections — toggle parent file
-      :hunk
-      (when-let [parent (section :parent)]
-        (when-let [expand-key (get-in parent [:data :expand-key])]
-          (put expanded-files expand-key nil)
-          (put-in b [:locals :expanded-files] expanded-files)
-          (re-render-status b))))))
+    # Commit: toggle inline diff expansion
+    :commit
+    (when-let [hash (item :hash)]
+      (def expanded-commits
+        (or (get-in b [:locals :expanded-commits]) @{}))
+      (def commit-diffs
+        (or (get-in b [:locals :commit-diffs]) @{}))
+      (if (expanded-commits hash)
+        (put expanded-commits hash nil)
+        (do
+          (put expanded-commits hash true)
+          # Fetch and cache the commit diff if not already cached
+          (unless (commit-diffs hash)
+            (use-buffer-root)
+            (def result (git/run "show" "--format=" hash))
+            (when (= (result :exit) 0)
+              (put commit-diffs hash
+                   (git/parse-diff (result :stdout)))))))
+      (put-in b [:locals :expanded-commits] expanded-commits)
+      (put-in b [:locals :commit-diffs] commit-diffs)
+      (re-render-status b))
+
+    # Hunk header: collapse parent file
+    :hunk-header
+    (when-let [expand-key (string (item :status) ":" (item :path))]
+      (def expanded-files
+        (or (get-in b [:locals :expanded-files]) @{}))
+      (put expanded-files expand-key nil)
+      (put-in b [:locals :expanded-files] expanded-files)
+      (re-render-status b))))
 
 (defn- set-visibility-level [level]
   (def b (buffer))
-  # Level 1 = collapse all, level 4 = expand all
   (def collapsed-sections
     (or (get-in b [:locals :collapsed-sections]) @{}))
   (if (<= level 1)
     (do
-      (each key [:untracked :unstaged :staged :log :stash]
+      (each key [:untracked :unstaged :staged :log :stash
+                  :unpushed :unpulled]
         (put collapsed-sections key true))
       (put-in b [:locals :expanded-files] @{}))
-      (do
-        (each key [:untracked :unstaged :staged :log :stash]
-          (put collapsed-sections key nil))
-        (when (>= level 3)
-          # Level 3+ expands files too — but we'd need to know which
-          # files exist, so just clear collapsed state for now
-          nil)))
-    (put-in b [:locals :collapsed-sections] collapsed-sections)
-    (re-render-status b))
+    (do
+      (each key [:untracked :unstaged :staged :log :stash
+                  :unpushed :unpulled]
+        (put collapsed-sections key nil))))
+  (put-in b [:locals :collapsed-sections] collapsed-sections)
+  (re-render-status b))
 
 (command/defcmd git-visibility-level-1
   "Collapse all sections." :label "Visibility Level 1" []
@@ -801,132 +879,140 @@
   "Expand all sections and files." :label "Visibility Level 4" []
   (set-visibility-level 4))
 
-# --- Staging operations ---
+# ════════════════════════════════════════════════════════════════════
+# Staging operations
+# ════════════════════════════════════════════════════════════════════
 
 (defn- hunk-region-lines
-  "If the buffer has an active line selection within the current hunk section,
+  "If the buffer has an active line selection within a hunk,
   return [sel-start sel-end] as 0-indexed offsets into hunk :lines.
+  Uses the item's :line-idx and the selection range.
   Otherwise return nil (meaning stage the whole hunk)."
-  [b section]
+  [b item]
   (def sel-range (line-select-range b))
   (unless sel-range (break nil))
   (def [sel-first sel-last] sel-range)
-  (def hunk-data (get-in section [:data :hunk]))
-  (unless hunk-data (break nil))
-  # The hunk section spans lines section:start to section:end.
-  # Line section:start is the hunk header, actual diff lines start at +1.
-  (def first-content-line (+ (section :start) 1))
-  # Convert to hunk-relative offsets (0-indexed into hunk :lines)
-  (def rel-start (- sel-first first-content-line))
-  (def rel-end (- sel-last first-content-line))
-  (def max-idx (- (length (hunk-data :lines)) 1))
-  # Only valid if selection is within the hunk content lines
-  (when (and (>= rel-start 0) (<= rel-end max-idx))
-    [(max 0 rel-start) (min max-idx rel-end)]))
-
-(defn- find-parent-file-section
-  "Walk up from a section to find the parent :file section."
-  [section]
-  (var s (section :parent))
-  (while (and s (not= (s :type) :file))
-    (set s (s :parent)))
-  s)
-
-(defn- file-status-for-hunk
-  "Determine the file status for a hunk by finding its parent file section."
-  [section]
-  (when-let [file-sec (find-parent-file-section section)]
-    (get-in file-sec [:data :status])))
+  # Find the line-idx values for the selected buffer lines
+  (def vbs (get-in b [:locals :vb]))
+  (def lm (vbs :line-map))
+  # Check that all selected lines are diff-lines in the same hunk
+  (var min-idx nil)
+  (var max-idx nil)
+  (for i sel-first (+ sel-last 1)
+    (when (< i (length lm))
+      (def sel-item (get-in lm [i :item]))
+      (when (and sel-item
+                 (= (sel-item :type) :diff-line)
+                 (= (sel-item :hunk) (item :hunk)))
+        (def idx (sel-item :line-idx))
+        (when (or (nil? min-idx) (< idx min-idx)) (set min-idx idx))
+        (when (or (nil? max-idx) (> idx max-idx)) (set max-idx idx)))))
+  (when (and min-idx max-idx)
+    [min-idx max-idx]))
 
 (command/defcmd git-stage
   "Stage the file, hunk, or section at point."
   :label "Stage"
   []
-  (let [b (buffer)
-        line (cursor-line)
-        section (sec/section-at-line b line)]
-    (unless section (break))
-    (let [data (section :data)
-          root (get-in b [:locals :git-root])]
-      (unless root (break))
-      (use-buffer-root)
+  (def b (buffer))
+  (def item (current-item))
+  (unless item (break))
+  (def root (get-in b [:locals :git-root]))
+  (unless root (break))
+  (use-buffer-root)
 
-  (case (section :type)
-    # Stage a single file
+  (case (item :type)
     :file
     (do
-      (case (data :status)
-        :untracked (git/run "add" (data :path))
-        :unstaged (git/run "add" (data :path))
+      (case (item :status)
+        :untracked (git/run "add" (item :path))
+        :unstaged (git/run "add" (item :path))
         nil)
-      (when (data :path)
-        (editor/message (string "Staged " (data :path)))))
+      (when (item :path)
+        (editor/message (string "Staged " (item :path)))))
 
-    # Stage a hunk (or region within a hunk)
-    :hunk
-    (when (= (file-status-for-hunk section) :unstaged)
-      (def file-diff (data :file-diff))
-      (def hunk (data :hunk))
-      (def region (hunk-region-lines b section))
+    :hunk-header
+    (when (= (item :status) :unstaged)
+      (def patch (git/make-hunk-patch (item :file-diff) (item :hunk)))
+      (def result (git/run-with-input patch "apply" "--cached"))
+      (if (= (result :exit) 0)
+        (editor/message "Staged hunk.")
+        (editor/message (string "Stage hunk failed: " (result :stderr)))))
+
+    :diff-line
+    (when (= (item :status) :unstaged)
+      (def region (hunk-region-lines b item))
       (def patch
         (if region
-          (git/make-region-patch file-diff hunk (region 0) (region 1))
-          (git/make-hunk-patch file-diff hunk)))
+          (git/make-region-patch (item :file-diff) (item :hunk)
+                                (region 0) (region 1))
+          (git/make-hunk-patch (item :file-diff) (item :hunk))))
       (def result (git/run-with-input patch "apply" "--cached"))
       (if (= (result :exit) 0)
         (editor/message (if region "Staged region." "Staged hunk."))
-        (editor/message (string "Stage hunk failed: " (result :stderr)))))
+        (editor/message (string "Stage failed: " (result :stderr)))))
 
-    # Stage all files in a section header
-    :section-header
-    (case (data :status)
+    :section-heading
+    (case (item :status)
       :untracked
-      (each child (section :children)
-        (git/run "add" (get-in child [:data :path])))
+      (do
+        (def git-data (get-in b [:locals :git-data]))
+        (each entry ((git-data :status) :entries)
+          (when (= (entry :type) :untracked)
+            (git/run "add" (entry :path)))))
       :unstaged
-      (each child (section :children)
-        (git/run "add" (get-in child [:data :path])))
+      (do
+        (def git-data (get-in b [:locals :git-data]))
+        (each entry ((git-data :status) :entries)
+          (when (entry :unstaged)
+            (git/run "add" (entry :path)))))
       nil))
 
-  # Clear selection after staging
   (line-select-clear b)
   (do-status-refresh b)
-  (hook/fire :git-post-operation :stage [] 0))))
+  (hook/fire :git-post-operation :stage [] 0))
 
 (command/defcmd git-unstage
   "Unstage the file, hunk, or section at point."
   :label "Unstage"
   []
   (def b (buffer))
-  (def line (cursor-line))
-  (def section (sec/section-at-line b line))
-  (unless section (break))
-  (def data (section :data))
+  (def item (current-item))
+  (unless item (break))
   (use-buffer-root)
 
-  (case (section :type)
+  (case (item :type)
     :file
-    (when (= (data :status) :staged)
-      (git/run "restore" "--staged" (data :path)))
+    (when (= (item :status) :staged)
+      (git/run "restore" "--staged" (item :path)))
 
-    :hunk
-    (when (= (file-status-for-hunk section) :staged)
-      (def file-diff (data :file-diff))
-      (def hunk (data :hunk))
-      (def region (hunk-region-lines b section))
+    :hunk-header
+    (when (= (item :status) :staged)
+      (def patch (git/make-hunk-patch (item :file-diff) (item :hunk)))
+      (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
+      (if (= (result :exit) 0)
+        (editor/message "Unstaged hunk.")
+        (editor/message (string "Unstage hunk failed: " (result :stderr)))))
+
+    :diff-line
+    (when (= (item :status) :staged)
+      (def region (hunk-region-lines b item))
       (def patch
         (if region
-          (git/make-region-patch file-diff hunk (region 0) (region 1) true)
-          (git/make-hunk-patch file-diff hunk)))
+          (git/make-region-patch (item :file-diff) (item :hunk)
+                                (region 0) (region 1) true)
+          (git/make-hunk-patch (item :file-diff) (item :hunk))))
       (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
       (if (= (result :exit) 0)
         (editor/message (if region "Unstaged region." "Unstaged hunk."))
-        (editor/message (string "Unstage hunk failed: " (result :stderr)))))
+        (editor/message (string "Unstage failed: " (result :stderr)))))
 
-    :section-header
-    (when (= (data :status) :staged)
-      (each child (section :children)
-        (git/run "restore" "--staged" (get-in child [:data :path])))))
+    :section-heading
+    (when (= (item :status) :staged)
+      (def git-data (get-in b [:locals :git-data]))
+      (each entry ((git-data :status) :entries)
+        (when (entry :staged)
+          (git/run "restore" "--staged" (entry :path))))))
 
   (line-select-clear b)
   (do-status-refresh b)
@@ -937,10 +1023,8 @@
   :label "Discard"
   []
   (def b (buffer))
-  (def line (cursor-line))
-  (def section (sec/section-at-line b line))
-  (unless section (break))
-  (def data (section :data))
+  (def item (current-item))
+  (unless item (break))
   (use-buffer-root)
 
   (defn discard-file [path status]
@@ -950,13 +1034,12 @@
       nil))
 
   (defn discard-hunk []
-    (def file-diff (data :file-diff))
-    (def hunk (data :hunk))
-    (def region (hunk-region-lines b section))
+    (def region (hunk-region-lines b item))
     (def patch
       (if region
-        (git/make-region-patch file-diff hunk (region 0) (region 1))
-        (git/make-hunk-patch file-diff hunk)))
+        (git/make-region-patch (item :file-diff) (item :hunk)
+                              (region 0) (region 1))
+        (git/make-hunk-patch (item :file-diff) (item :hunk))))
     (git/run-with-input patch "apply" "--reverse"))
 
   (prompt/activate
@@ -964,38 +1047,43 @@
      :on-submit
      (fn [input]
        (when (= (string/ascii-lower (string/trim input)) "y")
-         (case (section :type)
-           :file (discard-file (data :path) (data :status))
-           :hunk (discard-hunk)
-           :section-header
-           (each child (section :children)
-             (discard-file (get-in child [:data :path])
-                           (get-in child [:data :status]))))
+         (case (item :type)
+           :file (discard-file (item :path) (item :status))
+           :hunk-header (discard-hunk)
+           :diff-line (discard-hunk)
+           :section-heading
+           (do
+             (def git-data (get-in b [:locals :git-data]))
+             (each entry ((git-data :status) :entries)
+               (when (or (and (= (item :status) :untracked)
+                              (= (entry :type) :untracked))
+                         (and (= (item :status) :unstaged)
+                              (entry :unstaged)))
+                 (discard-file (entry :path) (item :status))))))
          (line-select-clear b)
          (do-status-refresh b)
          (hook/fire :git-post-operation :discard [] 0)))}))
 
-# --- Visit thing at point ---
+# ════════════════════════════════════════════════════════════════════
+# Visit thing at point
+# ════════════════════════════════════════════════════════════════════
 
 (defn- visit-hunk-line
-  "Visit the file at the diff line under the cursor within a hunk section.
-  Context and added lines open the working copy at the corresponding line.
-  Removed lines open a temporary buffer with the old file version."
-  [b line section]
+  "Visit the file at the diff line under the cursor.
+  Context and added lines open the working copy.
+  Removed lines open a temporary buffer with the old version."
+  [item]
+  (def b (buffer))
   (def root (get-in b [:locals :git-root]))
   (unless root (break))
   (use-buffer-root)
 
-  (def hunk (get-in section [:data :hunk]))
-  (def file-diff (get-in section [:data :file-diff]))
+  (def hunk (item :hunk))
+  (def file-diff (item :file-diff))
   (unless (and hunk file-diff) (break))
 
-  # Determine which hunk line the cursor is on
-  (def hunk-content-start (+ (section :start) 1))
-  (def line-idx (- line hunk-content-start))
-  (def hunk-lines (hunk :lines))
-  (when (or (< line-idx 0) (>= line-idx (length hunk-lines)))
-    # Cursor is on the hunk header — visit the file at hunk start
+  # For hunk-header items, jump to hunk start in the file
+  (when (= (item :type) :hunk-header)
     (when-let [file-path (file-diff :file)]
       (def full-path (string root "/" file-path))
       (def target-line (- (hunk :new-start) 1))
@@ -1003,6 +1091,12 @@
       (when (and opened (> target-line 0))
         (when-let [pos (buf/line-byte-offset opened target-line)]
           (set-cursor pos))))
+    (break))
+
+  # For diff-line items
+  (def line-idx (item :line-idx))
+  (def hunk-lines (hunk :lines))
+  (when (or (nil? line-idx) (>= line-idx (length hunk-lines)))
     (break))
 
   (def diff-line (get hunk-lines line-idx))
@@ -1025,9 +1119,7 @@
   (cond
     # Removed line — show old version from git
     (= prefix "-")
-    (let [file-status (file-status-for-hunk section)
-          # Unstaged diffs compare index vs worktree — old version is index.
-          # Staged diffs compare HEAD vs index — old version is HEAD.
+    (let [file-status (item :status)
           ref-path (if (= file-status :staged)
                      (string "HEAD:" old-file-path)
                      (string ":" old-file-path))
@@ -1039,7 +1131,6 @@
         (put-in view-buf [:locals :git-root] root)
         (db/pop-to-buffer view-buf (editor/get-state)
                           :actions [:reuse :split-right])
-        # Jump to the target line (0-indexed)
         (def target-line (- old-line 1))
         (when (> target-line 0)
           (when-let [pos (buf/line-byte-offset view-buf target-line)]
@@ -1057,24 +1148,26 @@
   "Visit the thing at point (file, hunk line, or commit)."
   :label "Visit"
   []
+  (def item (current-item))
+  (unless item (break))
   (def b (buffer))
-  (def line (cursor-line))
-  (def section (sec/section-at-line b line))
-  (unless section (break))
 
-  (case (section :type)
+  (case (item :type)
     :file
-    (let [path (get-in section [:data :path])
+    (let [path (item :path)
           root (get-in b [:locals :git-root])]
       (when (and path root)
         (editor/open-file (string root "/" path) (editor/get-state))))
 
-    :hunk
-    (visit-hunk-line b line section)
+    :hunk-header
+    (visit-hunk-line item)
+
+    :diff-line
+    (visit-hunk-line item)
 
     :commit
-    (let [hash (get-in section [:data :hash])]
-      (when hash (show-commit-diff hash)))
+    (when-let [hash (item :hash)]
+      (show-commit-diff hash))
 
     nil))
 
@@ -1091,11 +1184,11 @@
   (or (status-bufs root)
       (let [basename (last (string/split "/" root))
             name (string "*git-status: " basename "*")
-            b (buf/new name)]
-        (mode/activate-major b status-mode)
-        (put b :readonly true)
+            b (vb/create name
+                :render render-status-item
+                :id-fn |($ :id)
+                :mode status-mode)]
         (put b :hide-gutter true)
-        (undo/init b)
         (put-in b [:locals :git-root] root)
         (put-in b [:locals :project-root] root)
         (put-in b [:locals :default-directory] root)
@@ -2688,7 +2781,6 @@
          (do (editor-message (string "Hard reset to " rev))
              (when status-buf (do-status-refresh status-buf)))
          (editor-message (string "Reset failed: " (result :stderr)))))}))
-
 (transient/define :git-reset
   :description "Reset"
   :groups
@@ -2769,68 +2861,55 @@
 # --- Git dispatch (top-level transient) ---
 
 (command/defcmd git-commit-transient
-  "Open commit transient."
-  :label "Commit"
+  "Open commit transient." :label "Commit"
   [] (transient/activate :git-commit))
 
 (command/defcmd git-branch-transient
-  "Open branch transient."
-  :label "Branch"
+  "Open branch transient." :label "Branch"
   [] (transient/activate :git-branch))
 
 (command/defcmd git-push-transient
-  "Open push transient."
-  :label "Push"
+  "Open push transient." :label "Push"
   [] (transient/activate :git-push))
 
 (command/defcmd git-pull-transient
-  "Open pull transient."
-  :label "Pull"
+  "Open pull transient." :label "Pull"
   [] (transient/activate :git-pull))
 
 (command/defcmd git-fetch-transient
-  "Open fetch transient."
-  :label "Fetch"
+  "Open fetch transient." :label "Fetch"
   [] (transient/activate :git-fetch))
 
 (command/defcmd git-log-transient
-  "Open log transient."
-  :label "Log"
+  "Open log transient." :label "Log"
   [] (transient/activate :git-log))
 
 (command/defcmd git-diff-transient
-  "Open diff transient."
-  :label "Diff"
+  "Open diff transient." :label "Diff"
   [] (transient/activate :git-diff))
 
 (command/defcmd git-stash-transient
-  "Open stash transient."
-  :label "Stash"
+  "Open stash transient." :label "Stash"
   [] (transient/activate :git-stash))
 
 (command/defcmd git-merge-transient
-  "Open merge transient."
-  :label "Merge"
+  "Open merge transient." :label "Merge"
   [] (transient/activate :git-merge))
 
 (command/defcmd git-rebase-transient
-  "Open rebase transient."
-  :label "Rebase"
+  "Open rebase transient." :label "Rebase"
   [] (transient/activate :git-rebase))
 
 (command/defcmd git-cherry-pick-transient
-  "Open cherry-pick transient."
-  :label "Cherry-pick"
+  "Open cherry-pick transient." :label "Cherry-pick"
   [] (transient/activate :git-cherry-pick))
 
 (command/defcmd git-reset-transient
-  "Open reset transient."
-  :label "Reset"
+  "Open reset transient." :label "Reset"
   [] (transient/activate :git-reset))
 
 (command/defcmd git-tag-transient
-  "Open tag transient."
-  :label "Tag"
+  "Open tag transient." :label "Tag"
   [] (transient/activate :git-tag))
 
 (transient/define :git-dispatch
@@ -2882,12 +2961,12 @@
 (keymap/bind status-keymap "z" git-stash-transient)
 
 # --- Status keymap: navigation and operations ---
+# Navigation (j/k/gg/G/C-f/C-b/?) inherited from virtual-buffer-keymap.
 
 (def status-g-map (keymap/new))
 (keymap/bind status-g-map "r" git-refresh)
 (keymap/bind status-g-map "g" move/beginning-of-buffer)
 (keymap/bind status-keymap "g" status-g-map)
-(keymap/bind status-keymap "G" move/end-of-buffer)
 (keymap/bind status-keymap "n" git-next-section)
 (keymap/bind status-keymap "p" git-prev-section)
 (keymap/bind status-keymap "M-n" git-next-sibling)
@@ -2943,12 +3022,38 @@
 # Copy / yank commands
 # ════════════════════════════════════════════════════════════════════
 
-(defn- section-copy-value
-  "Return the copyable string value for the section at the current line.
-  For commits returns the full SHA (resolved via rev-parse), for files
-  the path, for stashes the stash ref."
+(defn- item-copy-value
+  "Return the copyable string value for the item at cursor.
+  For commits returns the full SHA, for files the path, for stashes
+  the stash ref. Falls back to section-based lookup for log/diff buffers."
   []
   (def b (buffer))
+  # Try VB item first (status buffer)
+  (def p (status-pane b))
+  (when p
+    (def item (vb/item-at-cursor b p))
+    (when item
+      (case (item :type)
+        :commit
+        (when-let [hash (item :hash)]
+          (use-buffer-root)
+          (def result (git/run "rev-parse" hash))
+          (break (if (= (result :exit) 0)
+                   (string/trim (result :stdout))
+                   hash)))
+
+        :file
+        (break (item :path))
+
+        :stash
+        (break (item :ref))
+
+        :section-heading
+        (break (when-let [status (item :status)]
+                 (string status)))
+
+        nil)))
+  # Fall back to section-based lookup (log/diff buffers)
   (def section (sec/section-at-line b (cursor-line)))
   (unless section (break nil))
   (def data (section :data))
@@ -2961,17 +3066,11 @@
         (string/trim (result :stdout))
         hash))
 
-    :file
-    (data :path)
-
-    :stash
-    (data :ref)
-
-    # Section headers — return status key name
+    :file (data :path)
+    :stash (data :ref)
     :section-header
     (when-let [status (data :status)]
       (string status))
-
     nil))
 
 (command/defcmd git-copy-section-value
@@ -2980,7 +3079,7 @@
   the stash ref."
   :label "Copy Section Value"
   []
-  (if-let [value (section-copy-value)]
+  (if-let [value (item-copy-value)]
     (do
       (kill-ring/push value)
       (editor/message (string "Copied: " value)))
@@ -3068,17 +3167,13 @@
 # ════════════════════════════════════════════════════════════════════
 
 (defn- detect-git-root []
-  "Detect the git root for the current context.
-  Checks: 1) current buffer's :git-root local, 2) current buffer's
-  file directory, 3) CWD. Sets (dyn :git-root) and returns the root."
+  "Detect the git root for the current context."
   (def b (buffer))
   (when b
-    # If we're already in a git buffer, use its stored root
     (def stored-root (get-in b [:locals :git-root]))
     (when stored-root
       (setdyn :git-root stored-root)
       (break stored-root))
-    # Detect from current buffer's file
     (when-let [file (b :file)]
       (def dir (string/join (slice (string/split "/" file) 0 -2) "/"))
       (when (> (length dir) 0)
@@ -3087,7 +3182,6 @@
         (when root
           (setdyn :git-root root)
           (break root)))))
-  # Fall back to CWD
   (setdyn :git-root nil)
   (git/repo-root))
 
@@ -3141,7 +3235,6 @@
 (hook/add :after-save
   (fn [b]
     (when (and refresh-on-save status-buf)
-      # Generation-based debounce: only the latest trigger fires
       (def root (get-in status-buf [:locals :git-root]))
       (def gen (++ refresh-generation))
       (ev/spawn
@@ -3154,7 +3247,6 @@
 
 (hook/add :git-post-operation
   (fn [op args exit]
-    # After tree-changing operations, revert unmodified file buffers
     (when (find |(= op $) [:checkout :pull :stash-pop :merge :rebase])
       (each b (editor/buffers)
         (when (and (b :file)
