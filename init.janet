@@ -40,6 +40,14 @@
   []
   (setdyn :git-root (get-in (buffer) [:locals :git-root])))
 
+(defn- with-git-root
+  ``Wrap a callback to preserve the current :git-root dynamic binding.
+  Use around prompt :on-submit / :on-accept callbacks that run git commands,
+  since the prompt deactivation changes the dynamic environment.``
+  [callback]
+  (def root (dyn :git-root))
+  (fn [& args] (setdyn :git-root root) (callback ;args)))
+
 # ════════════════════════════════════════════════════════════════════
 # Faces
 # ════════════════════════════════════════════════════════════════════
@@ -141,6 +149,8 @@
 (var show-commit-diff nil)
 (var apply-diff-overlays nil)
 (var diff-mode nil)
+
+(var stash-item-keymap nil)
 
 # --- Status mode keymap (inherits VB navigation: j/k/gg/G/C-f/C-b/q/?) ---
 
@@ -247,6 +257,8 @@
     :display-name "Git Status"
     :category :special
     :keymap status-keymap
+    :keymap-fn (fn [b] (when-let [p (dyn :current-pane)]
+                         (vb/item-keymap b p)))
     :suppress-self-insert true})
 
 (mode/register status-mode)
@@ -553,6 +565,7 @@
             :status :stash
             :ref (stash :ref)
             :message (stash :message)
+            :keymap stash-item-keymap
             :stash-data stash}))))
 
   items)
@@ -1045,7 +1058,7 @@
   (prompt/activate
     {:prompt "Discard changes? (y/n) "
      :on-submit
-     (fn [input]
+     (with-git-root (fn [input]
        (when (= (string/ascii-lower (string/trim input)) "y")
          (case (item :type)
            :file (discard-file (item :path) (item :status))
@@ -1062,7 +1075,7 @@
                  (discard-file (entry :path) (item :status))))))
          (line-select-clear b)
          (do-status-refresh b)
-         (hook/fire :git-post-operation :discard [] 0)))}))
+         (hook/fire :git-post-operation :discard [] 0))))}))
 
 # ════════════════════════════════════════════════════════════════════
 # Visit thing at point
@@ -1169,6 +1182,21 @@
     (when-let [hash (item :hash)]
       (show-commit-diff hash))
 
+    :stash
+    (when-let [ref (item :ref)]
+      (use-buffer-root)
+      (def result (git/run "stash" "show" "-p" ref))
+      (when (= (result :exit) 0)
+        (def sb (editor/make-view-buffer (string "*git-stash: " ref "*") (result :stdout)))
+        (mode/activate-major sb diff-mode)
+        (put sb :hide-gutter true)
+        (put-in sb [:locals :git-root] (dyn :git-root))
+        (put-in sb [:locals :project-root] (dyn :git-root))
+        (put-in sb [:locals :default-directory] (dyn :git-root))
+        (apply-diff-overlays sb)
+        (db/pop-to-buffer sb (editor/get-state)
+                          :actions [:reuse :same])))
+
     nil))
 
 (command/defcmd git-refresh
@@ -1214,7 +1242,8 @@
   []
   (def b (git/get-process-buffer))
   (db/pop-to-buffer b (editor/get-state)
-                    :actions [:reuse :split-below]))
+                    :actions [:reuse :split-below])
+  (move/end-of-buffer))
 
 # ════════════════════════════════════════════════════════════════════
 # Commit
@@ -1598,12 +1627,12 @@
   (prompt/activate
     {:prompt "Fixup commit: "
      :on-submit
-     (fn [hash]
+     (with-git-root (fn [hash]
        (def result (git/run "commit" "--fixup" hash))
        (if (= (result :exit) 0)
          (do (editor-message "Fixup commit created.")
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Fixup failed: " (result :stderr)))))}))
+         (editor-message (string "Fixup failed: " (result :stderr))))))}))
 
 (command/defcmd git-commit-instant-fixup
   "Create a fixup commit and immediately rebase."
@@ -1613,7 +1642,7 @@
   (prompt/activate
     {:prompt "Instant fixup commit: "
      :on-submit
-     (fn [hash]
+     (with-git-root (fn [hash]
        (def root (dyn :git-root))
        (def result (git/run "commit" "--fixup" hash))
        (when (= (result :exit) 0)
@@ -1624,7 +1653,7 @@
            (if (= (rb :exit) 0)
              (do (editor-message "Fixup applied.")
                  (when status-buf (do-status-refresh status-buf)))
-             (editor-message (string "Rebase failed: " (rb :stderr)))))))}))
+             (editor-message (string "Rebase failed: " (rb :stderr))))))))}))
 
 (command/defcmd git-commit-squash
   "Create a squash commit for a given commit."
@@ -1634,12 +1663,12 @@
   (prompt/activate
     {:prompt "Squash commit: "
      :on-submit
-     (fn [hash]
+     (with-git-root (fn [hash]
        (def result (git/run "commit" "--squash" hash))
        (if (= (result :exit) 0)
          (do (editor-message "Squash commit created.")
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Squash failed: " (result :stderr)))))}))
+         (editor-message (string "Squash failed: " (result :stderr))))))}))
 
 (transient/define :git-commit
   :description "Commit"
@@ -1674,13 +1703,13 @@
     {:prompt "Checkout branch: "
      :candidates (map |(do @{:text $}) branches)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (def result (git/run "checkout" (candidate :text)))
        (if (= (result :exit) 0)
          (do (editor-message (string "Switched to " (candidate :text)))
              (hook/fire :git-post-operation :checkout [(candidate :text)] 0)
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Checkout failed: " (result :stderr)))))}))
+         (editor-message (string "Checkout failed: " (result :stderr))))))}))
 
 (command/defcmd git-branch-create-and-checkout
   "Create a new branch and check it out."
@@ -1690,13 +1719,13 @@
   (prompt/activate
     {:prompt "Create and checkout branch: "
      :on-submit
-     (fn [name]
+     (with-git-root (fn [name]
        (def result (git/run "checkout" "-b" name))
        (if (= (result :exit) 0)
          (do (editor-message (string "Created and switched to " name))
              (hook/fire :git-post-operation :checkout [name] 0)
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Failed: " (result :stderr)))))}))
+         (editor-message (string "Failed: " (result :stderr))))))}))
 
 (command/defcmd git-branch-create
   "Create a new branch."
@@ -1706,11 +1735,11 @@
   (prompt/activate
     {:prompt "Create branch: "
      :on-submit
-     (fn [name]
+     (with-git-root (fn [name]
        (def result (git/run "branch" name))
        (if (= (result :exit) 0)
          (editor-message (string "Created branch " name))
-         (editor-message (string "Failed: " (result :stderr)))))}))
+         (editor-message (string "Failed: " (result :stderr))))))}))
 
 (command/defcmd git-branch-rename
   "Rename a branch."
@@ -1722,7 +1751,7 @@
     {:prompt "Rename branch: "
      :candidates (map |(do @{:text $}) branches)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (prompt/activate
          {:prompt (string "Rename " (candidate :text) " to: ")
           :on-submit
@@ -1731,7 +1760,7 @@
             (if (= (result :exit) 0)
               (do (editor-message (string "Renamed to " new-name))
                   (when status-buf (do-status-refresh status-buf)))
-              (editor-message (string "Failed: " (result :stderr)))))}))}))
+              (editor-message (string "Failed: " (result :stderr)))))})))}))
 
 (command/defcmd git-branch-delete
   "Delete a branch."
@@ -1743,7 +1772,7 @@
     {:prompt "Delete branch: "
      :candidates (map |(do @{:text $}) branches)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (prompt/activate
          {:prompt (string "Delete " (candidate :text) "? (y/n) ")
           :on-submit
@@ -1754,7 +1783,7 @@
                 (do (editor-message (string "Deleted " (candidate :text)))
                     (when status-buf (do-status-refresh status-buf)))
                 (editor-message (string "Failed: " (result :stderr)
-                                       " (use -D to force)")))))}))}))
+                                       " (use -D to force)")))))})))}))
 
 (command/defcmd git-branch-spinoff
   "Create a new branch from the current branch and reset current."
@@ -1764,7 +1793,7 @@
   (prompt/activate
     {:prompt "Spinoff branch name: "
      :on-submit
-     (fn [name]
+     (with-git-root (fn [name]
        (def branch (git/current-branch))
        (unless branch
          (editor-message "Cannot spinoff: not on a branch.")
@@ -1779,7 +1808,7 @@
              (def remote-branch (string/join (slice parts 1) "/"))
              (git/run "branch" "--force" branch (string remote "/" remote-branch))))
          (editor-message (string "Spun off " name " from " branch))
-         (when status-buf (do-status-refresh status-buf))))}))
+         (when status-buf (do-status-refresh status-buf)))))}))
 
 (command/defcmd git-branch-reset
   "Reset a branch to a revision."
@@ -1791,7 +1820,7 @@
     {:prompt "Reset branch: "
      :candidates (map |(do @{:text $}) branches)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (prompt/activate
          {:prompt (string "Reset " (candidate :text) " to: ")
           :on-submit
@@ -1800,7 +1829,7 @@
             (if (= (result :exit) 0)
               (do (editor-message (string "Reset " (candidate :text) " to " rev))
                   (when status-buf (do-status-refresh status-buf)))
-              (editor-message (string "Failed: " (result :stderr)))))}))}))
+              (editor-message (string "Failed: " (result :stderr)))))})))}))
 
 (transient/define :git-branch
   :description "Branch"
@@ -1880,11 +1909,11 @@
     {:prompt "Push to remote: "
      :candidates (map |(do @{:text $}) remotes)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (use-buffer-root)
        (def args (push-build-args (or (dyn :transient-args) @{})))
        (array/push args (candidate :text))
-       (push-run-async args (string "Pushing to " (candidate :text))))}))
+       (push-run-async args (string "Pushing to " (candidate :text)))))}))
 
 (command/defcmd git-push-tag
   "Push a tag to a remote."
@@ -1896,7 +1925,7 @@
     {:prompt "Push tag: "
      :candidates (map |(do @{:text $}) tags)
      :on-accept
-     (fn [tag-candidate]
+     (with-git-root (fn [tag-candidate]
        (def remotes (git/run-lines "remote"))
        (prompt/pick
          {:prompt "Push tag to remote: "
@@ -1908,7 +1937,7 @@
             (array/push args (remote-candidate :text))
             (array/push args (tag-candidate :text))
             (push-run-async args
-              (string "Pushing tag " (tag-candidate :text))))}))}))
+              (string "Pushing tag " (tag-candidate :text))))})))}))
 
 (command/defcmd git-push-all-tags
   "Push all tags to a remote."
@@ -1920,13 +1949,13 @@
     {:prompt "Push all tags to remote: "
      :candidates (map |(do @{:text $}) remotes)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (use-buffer-root)
        (def args (push-build-args (or (dyn :transient-args) @{})))
        (array/push args (candidate :text))
        (array/push args "--tags")
        (push-run-async args
-         (string "Pushing all tags to " (candidate :text))))}))
+         (string "Pushing all tags to " (candidate :text)))))}))
 
 (transient/define :git-push
   :description "Push"
@@ -2017,7 +2046,7 @@
     {:prompt "Pull from remote: "
      :candidates (map |(do @{:text $}) remotes)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (prompt/activate
          {:prompt (string "Branch on " (candidate :text) ": ")
           :on-submit
@@ -2027,7 +2056,7 @@
             (array/push args (candidate :text))
             (array/push args branch)
             (pull-run-async args
-              (string "Pulling from " (candidate :text) "/" branch)))}))}))
+              (string "Pulling from " (candidate :text) "/" branch)))})))}))
 
 (transient/define :git-pull
   :description "Pull"
@@ -2115,11 +2144,11 @@
     {:prompt "Fetch from remote: "
      :candidates (map |(do @{:text $}) remotes)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (use-buffer-root)
        (def args (fetch-build-args (or (dyn :transient-args) @{})))
        (array/push args (candidate :text))
-       (fetch-run-async args (string "Fetching from " (candidate :text))))}))
+       (fetch-run-async args (string "Fetching from " (candidate :text)))))}))
 
 (command/defcmd git-fetch-all
   "Fetch from all remotes."
@@ -2170,7 +2199,7 @@
   (prompt/activate
     {:prompt "Stash message (optional): "
      :on-submit
-     (fn [msg]
+     (with-git-root (fn [msg]
        (def args (stash-build-args (or (dyn :transient-args) @{})))
        (when (> (length (string/trim msg)) 0)
          (array/push args "-m" msg))
@@ -2179,7 +2208,7 @@
          (do (editor-message "Stashed.")
              (hook/fire :git-post-operation :stash args 0)
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Stash failed: " (result :stderr)))))}))
+         (editor-message (string "Stash failed: " (result :stderr))))))}))
 
 (command/defcmd git-stash-index
   "Stash only index (staged) changes."
@@ -2216,6 +2245,31 @@
         (hook/fire :git-post-operation :stash-pop [] 0)
         (when status-buf (do-status-refresh status-buf)))
     (editor-message (string "Stash pop failed: " (result :stderr)))))
+
+(command/defcmd git-stash-pop-at-point
+  "Pop the stash at point with confirmation."
+  :label "Stash Pop"
+  []
+  (def item (current-item))
+  (unless (and item (= (item :type) :stash))
+    (editor-message "No stash at point.")
+    (break))
+  (def ref (item :ref))
+  (use-buffer-root)
+  (prompt/activate
+    {:prompt (string "Pop " ref "? (y/n) ")
+     :on-submit
+     (with-git-root (fn [input]
+       (when (= (string/ascii-lower (string/trim input)) "y")
+         (def result (git/run "stash" "pop" ref))
+         (if (= (result :exit) 0)
+           (do (editor-message (string ref " popped."))
+               (hook/fire :git-post-operation :stash-pop [] 0)
+               (when status-buf (do-status-refresh status-buf)))
+           (editor-message (string "Stash pop failed: " (result :stderr)))))))}))
+
+(set stash-item-keymap (keymap/new))
+(keymap/bind stash-item-keymap "A" git-stash-pop-at-point)
 
 (command/defcmd git-stash-apply
   "Apply the top stash without removing it."
@@ -2309,8 +2363,8 @@
   (prompt/pick
     {:prompt "Log for branch: "
      :candidates (map |(do @{:text $}) branches)
-     :on-accept (fn [candidate]
-                  (open-log-buffer @{:branch (candidate :text)}))}))
+     :on-accept (with-git-root (fn [candidate]
+                  (open-log-buffer @{:branch (candidate :text)})))}))
 
 (command/defcmd git-log-file
   "Show log for current file."
@@ -2377,7 +2431,7 @@
   (prompt/activate
     {:prompt "Diff commit: "
      :on-submit
-     (fn [hash]
+     (with-git-root (fn [hash]
        (def result (git/run "diff" hash))
        (when (= (result :exit) 0)
          (def b (editor/make-view-buffer
@@ -2390,7 +2444,7 @@
          (put-in b [:locals :default-directory] (dyn :git-root))
          (apply-diff-overlays b)
          (db/pop-to-buffer b (editor/get-state)
-                           :actions [:reuse :same])))}))
+                           :actions [:reuse :same]))))}))
 
 (command/defcmd git-diff-range
   "Show diff for a revision range."
@@ -2400,7 +2454,7 @@
   (prompt/activate
     {:prompt "Diff range (e.g. main..HEAD): "
      :on-submit
-     (fn [range]
+     (with-git-root (fn [range]
        (def result (git/run "diff" range))
        (when (= (result :exit) 0)
          (def b (editor/make-view-buffer
@@ -2413,7 +2467,7 @@
          (put-in b [:locals :default-directory] (dyn :git-root))
          (apply-diff-overlays b)
          (db/pop-to-buffer b (editor/get-state)
-                           :actions [:reuse :same])))}))
+                           :actions [:reuse :same]))))}))
 
 (command/defcmd git-diff-worktree
   "Show diff between HEAD and worktree."
@@ -2459,7 +2513,7 @@
     {:prompt "Merge branch: "
      :candidates (map |(do @{:text $}) branches)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (use-buffer-root)
        (def targs (or (dyn :transient-args) @{}))
        (def args @["merge"])
@@ -2474,7 +2528,7 @@
          (do (editor-message (string "Merged " (candidate :text)))
              (hook/fire :git-post-operation :merge args 0)
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Merge failed: " (result :stderr)))))}))
+         (editor-message (string "Merge failed: " (result :stderr))))))}))
 
 (command/defcmd git-merge-abort
   "Abort the current merge."
@@ -2539,7 +2593,7 @@
     {:prompt "Rebase onto: "
      :candidates (map |(do @{:text $}) branches)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (use-buffer-root)
        (def targs (or (dyn :transient-args) @{}))
        (def args @["rebase"])
@@ -2561,7 +2615,7 @@
                    (when status-buf (do-status-refresh status-buf)))
                (editor/message (string "Rebase failed: " (result :stderr)))))
            ([err]
-             (editor/message (string "Rebase error: " err))))))}))
+             (editor/message (string "Rebase error: " err)))))))}))
 
 (command/defcmd git-rebase-interactive
   "Interactive rebase from a commit."
@@ -2571,7 +2625,7 @@
   (prompt/activate
     {:prompt "Rebase interactively from: "
      :on-submit
-     (fn [rev]
+     (with-git-root (fn [rev]
        (def root (dyn :git-root))
        (def targs (or (dyn :transient-args) @{}))
        (def args @["rebase" "--interactive"])
@@ -2590,7 +2644,7 @@
                    (when status-buf (do-status-refresh status-buf)))
                (editor/message (string "Rebase failed: " (result :stderr)))))
            ([err]
-             (editor/message (string "Rebase error: " err))))))}))
+             (editor/message (string "Rebase error: " err)))))))}))
 
 (command/defcmd git-rebase-continue
   "Continue an in-progress rebase."
@@ -2684,7 +2738,7 @@
   (prompt/activate
     {:prompt "Cherry-pick commit: "
      :on-submit
-     (fn [rev]
+     (with-git-root (fn [rev]
        (def targs (or (dyn :transient-args) @{}))
        (def args @["cherry-pick"])
        (when (targs "--no-commit") (array/push args "--no-commit"))
@@ -2695,7 +2749,7 @@
          (do (editor-message (string "Cherry-picked " rev))
              (hook/fire :git-post-operation :cherry-pick args 0)
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Cherry-pick failed: " (result :stderr)))))}))
+         (editor-message (string "Cherry-pick failed: " (result :stderr))))))}))
 
 (command/defcmd git-cherry-pick-continue
   "Continue an in-progress cherry-pick."
@@ -2745,12 +2799,12 @@
   (prompt/activate
     {:prompt "Soft reset to: "
      :on-submit
-     (fn [rev]
+     (with-git-root (fn [rev]
        (def result (git/run "reset" "--soft" rev))
        (if (= (result :exit) 0)
          (do (editor-message (string "Soft reset to " rev))
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Reset failed: " (result :stderr)))))}))
+         (editor-message (string "Reset failed: " (result :stderr))))))}))
 
 (command/defcmd git-reset-mixed
   "Mixed reset (keep worktree, unstage)."
@@ -2760,12 +2814,12 @@
   (prompt/activate
     {:prompt "Mixed reset to: "
      :on-submit
-     (fn [rev]
+     (with-git-root (fn [rev]
        (def result (git/run "reset" "--mixed" rev))
        (if (= (result :exit) 0)
          (do (editor-message (string "Mixed reset to " rev))
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Reset failed: " (result :stderr)))))}))
+         (editor-message (string "Reset failed: " (result :stderr))))))}))
 
 (command/defcmd git-reset-hard
   "Hard reset (discard staging and worktree)."
@@ -2775,12 +2829,12 @@
   (prompt/activate
     {:prompt "Hard reset to (THIS DISCARDS CHANGES): "
      :on-submit
-     (fn [rev]
+     (with-git-root (fn [rev]
        (def result (git/run "reset" "--hard" rev))
        (if (= (result :exit) 0)
          (do (editor-message (string "Hard reset to " rev))
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Reset failed: " (result :stderr)))))}))
+         (editor-message (string "Reset failed: " (result :stderr))))))}))
 (transient/define :git-reset
   :description "Reset"
   :groups
@@ -2802,7 +2856,7 @@
   (prompt/activate
     {:prompt "Tag name: "
      :on-submit
-     (fn [name]
+     (with-git-root (fn [name]
        (prompt/activate
          {:prompt "Tag message (empty for lightweight): "
           :on-submit
@@ -2815,7 +2869,7 @@
             (if (= (result :exit) 0)
               (do (editor-message (string "Created tag " name))
                   (when status-buf (do-status-refresh status-buf)))
-              (editor-message (string "Tag failed: " (result :stderr)))))}))}))
+              (editor-message (string "Tag failed: " (result :stderr)))))})))}))
 
 (command/defcmd git-tag-delete
   "Delete a tag."
@@ -2827,12 +2881,12 @@
     {:prompt "Delete tag: "
      :candidates (map |(do @{:text $}) tags)
      :on-accept
-     (fn [candidate]
+     (with-git-root (fn [candidate]
        (def result (git/run "tag" "-d" (candidate :text)))
        (if (= (result :exit) 0)
          (do (editor-message (string "Deleted tag " (candidate :text)))
              (when status-buf (do-status-refresh status-buf)))
-         (editor-message (string "Delete failed: " (result :stderr)))))}))
+         (editor-message (string "Delete failed: " (result :stderr))))))}))
 
 (command/defcmd git-tag-list
   "List tags."
@@ -2964,6 +3018,7 @@
 # Navigation (j/k/gg/G/C-f/C-b/?) inherited from virtual-buffer-keymap.
 
 (def status-g-map (keymap/new))
+(put status-g-map :show-hints true)
 (keymap/bind status-g-map "r" git-refresh)
 (keymap/bind status-g-map "g" move/beginning-of-buffer)
 (keymap/bind status-keymap "g" status-g-map)
