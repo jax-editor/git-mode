@@ -1236,9 +1236,9 @@
   (when p
     (db/quit-window p state)))
 
-(command/defcmd git-show-process-buffer
+(command/defcmd git-process-buffer
   "Show the git process output buffer."
-  :label "Show Process Buffer"
+  :label "Process Buffer"
   []
   (def b (git/get-process-buffer))
   (db/pop-to-buffer b (editor/get-state)
@@ -3033,8 +3033,8 @@
 (keymap/bind status-keymap "x" git-discard)
 (keymap/bind status-keymap "enter" git-visit)
 (keymap/bind status-keymap "q" git-quit)
-(keymap/bind status-keymap "$" git-show-process-buffer)
-(keymap/bind status-keymap "`" git-show-process-buffer)
+(keymap/bind status-keymap "$" git-process-buffer)
+(keymap/bind status-keymap "`" git-process-buffer)
 (keymap/bind status-keymap "v" git-toggle-line-select)
 (keymap/bind status-keymap "V" git-toggle-line-select)
 (keymap/bind status-keymap "escape" git-clear-selection)
@@ -3058,7 +3058,7 @@
 (def log-g-map (keymap/new))
 (keymap/bind log-g-map "g" move/beginning-of-buffer)
 (keymap/bind log-keymap "g" log-g-map)
-(keymap/bind log-keymap "$" git-show-process-buffer)
+(keymap/bind log-keymap "$" git-process-buffer)
 
 # --- Diff keymap bindings ---
 
@@ -3071,7 +3071,7 @@
 (def diff-g-map (keymap/new))
 (keymap/bind diff-g-map "g" move/beginning-of-buffer)
 (keymap/bind diff-keymap "g" diff-g-map)
-(keymap/bind diff-keymap "$" git-show-process-buffer)
+(keymap/bind diff-keymap "$" git-process-buffer)
 
 # ════════════════════════════════════════════════════════════════════
 # Copy / yank commands
@@ -3272,12 +3272,6 @@
   (setdyn :git-root root)
   (set status-buf (get-or-create-status-buffer root))
   (transient/activate :git-dispatch))
-
-(command/defcmd git-process-buffer
-  "Show the git process log buffer."
-  :label "Git Process Buffer"
-  []
-  (git-show-process-buffer))
 
 # --- Global keybindings ---
 
