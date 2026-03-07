@@ -256,9 +256,12 @@
   @{:name "git-status"
     :display-name "Git Status"
     :category :special
-    :keymap status-keymap
-    :keymap-fn (fn [b] (when-let [p (dyn :current-pane)]
-                         (vb/item-keymap b p)))
+    :keymap (fn [b]
+              (def item-km (when-let [p (dyn :current-pane)]
+                             (vb/item-keymap b p)))
+              (if item-km
+                [item-km status-keymap]
+                status-keymap))
     :suppress-self-insert true})
 
 (mode/register status-mode)
