@@ -3305,3 +3305,47 @@
                    (not (b :modified))
                    (os/stat (b :file)))
           (git/revert-buffer b))))))
+
+# --- Leader bindings ---
+
+(hook/after-load "jax/leader"
+  (fn []
+    (def leader (require "jax/leader"))
+    (def bind (get-in leader ['bind :value]))
+    (def bind-group (get-in leader ['bind-group :value]))
+
+    (bind-group "g" "+git"
+      "g" git-status
+      "G" git-dispatch
+      "c" git-commit-transient
+      "b" git-branch-transient
+      "P" git-push-transient
+      "F" git-pull-transient
+      "f" git-fetch-transient
+      "m" git-merge-transient
+      "r" git-rebase-transient
+      "A" git-cherry-pick-transient
+      "X" git-reset-transient
+      "t" git-tag-transient
+      "l" git-log-transient
+      "d" git-diff-transient
+      "z" git-stash-transient)
+
+    (when-let [status-mode (mode/get-mode :git-status)
+               resolved (mode/resolve-keymap status-mode)]
+      (def status-km (if (indexed? resolved) (last resolved) resolved))
+      (keymap/bind status-km "`" git-process-buffer))
+
+    (each mode-name [:git-status :git-log :git-diff]
+      (when-let [m (mode/get-mode mode-name)
+                 resolved (mode/resolve-keymap m)]
+        (def km (if (indexed? resolved) (last resolved) resolved))
+        (let [y-map (keymap/new)]
+          (keymap/bind y-map "s" git-copy-section-value)
+          (keymap/bind y-map "b" git-copy-buffer-revision)
+          (keymap/bind y-map "r" git-show-refs)
+          (keymap/bind y-map "y" git-yank-whole-line)
+          (keymap/bind km "y" y-map))))
+
+    (bind-group "p" nil
+      "v" git-status)))
