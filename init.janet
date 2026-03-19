@@ -899,6 +899,27 @@
 # Staging operations
 # ════════════════════════════════════════════════════════════════════
 
+(defn- selected-file-items
+  "If there is an active line selection, return an array of unique
+  :file items within that range. Returns nil if no selection or no
+  file items found."
+  [b]
+  (when-let [sel-range (line-select-range b)]
+    (let [[sel-first sel-last] sel-range
+          vbs (get-in b [:locals :vb])
+          lm (vbs :line-map)
+          seen @{}
+          result @[]]
+      (for i sel-first (+ sel-last 1)
+        (when (< i (length lm))
+          (when-let [item (get-in lm [i :item])]
+            (when (and (= (item :type) :file)
+                       (item :path)
+                       (not (has-key? seen (item :path))))
+              (put seen (item :path) true)
+              (array/push result item)))))
+      (when (> (length result) 0) result))))
+
 (defn- hunk-region-lines
   "If the buffer has an active line selection within a hunk,
   return [sel-start sel-end] as 0-indexed offsets into hunk :lines.
@@ -927,7 +948,8 @@
     [min-idx max-idx]))
 
 (command/defcmd git-stage
-  "Stage the file, hunk, or section at point."
+  "Stage the file, hunk, or section at point.
+  When a line selection spans multiple files, stages all selected files."
   :label "Stage"
   []
   (def b (buffer))
@@ -937,59 +959,69 @@
   (unless root (break))
   (use-buffer-root)
 
-  (case (item :type)
-    :file
+  # When line selection covers multiple files, stage them all
+  (if-let [files (selected-file-items b)]
     (do
+      (each f files
+        (case (f :status)
+          :untracked (git/run "add" (f :path))
+          :unstaged (git/run "add" (f :path))))
+      (editor/message (string "Staged " (length files) " files.")))
+
+    (case (item :type)
+      :file
+      (do
+        (case (item :status)
+          :untracked (git/run "add" (item :path))
+          :unstaged (git/run "add" (item :path))
+          nil)
+        (when (item :path)
+          (editor/message (string "Staged " (item :path)))))
+
+      :hunk-header
+      (when (= (item :status) :unstaged)
+        (def patch (git/make-hunk-patch (item :file-diff) (item :hunk)))
+        (def result (git/run-with-input patch "apply" "--cached"))
+        (if (= (result :exit) 0)
+          (editor/message "Staged hunk.")
+          (editor/message (string "Stage hunk failed: " (result :stderr)))))
+
+      :diff-line
+      (when (= (item :status) :unstaged)
+        (def region (hunk-region-lines b item))
+        (def patch
+          (if region
+            (git/make-region-patch (item :file-diff) (item :hunk)
+                                  (region 0) (region 1))
+            (git/make-hunk-patch (item :file-diff) (item :hunk))))
+        (def result (git/run-with-input patch "apply" "--cached"))
+        (if (= (result :exit) 0)
+          (editor/message (if region "Staged region." "Staged hunk."))
+          (editor/message (string "Stage failed: " (result :stderr)))))
+
+      :section-heading
       (case (item :status)
-        :untracked (git/run "add" (item :path))
-        :unstaged (git/run "add" (item :path))
-        nil)
-      (when (item :path)
-        (editor/message (string "Staged " (item :path)))))
-
-    :hunk-header
-    (when (= (item :status) :unstaged)
-      (def patch (git/make-hunk-patch (item :file-diff) (item :hunk)))
-      (def result (git/run-with-input patch "apply" "--cached"))
-      (if (= (result :exit) 0)
-        (editor/message "Staged hunk.")
-        (editor/message (string "Stage hunk failed: " (result :stderr)))))
-
-    :diff-line
-    (when (= (item :status) :unstaged)
-      (def region (hunk-region-lines b item))
-      (def patch
-        (if region
-          (git/make-region-patch (item :file-diff) (item :hunk)
-                                (region 0) (region 1))
-          (git/make-hunk-patch (item :file-diff) (item :hunk))))
-      (def result (git/run-with-input patch "apply" "--cached"))
-      (if (= (result :exit) 0)
-        (editor/message (if region "Staged region." "Staged hunk."))
-        (editor/message (string "Stage failed: " (result :stderr)))))
-
-    :section-heading
-    (case (item :status)
-      :untracked
-      (do
-        (def git-data (get-in b [:locals :git-data]))
-        (each entry ((git-data :status) :entries)
-          (when (= (entry :type) :untracked)
-            (git/run "add" (entry :path)))))
-      :unstaged
-      (do
-        (def git-data (get-in b [:locals :git-data]))
-        (each entry ((git-data :status) :entries)
-          (when (entry :unstaged)
-            (git/run "add" (entry :path)))))
-      nil))
+        :untracked
+        (do
+          (def git-data (get-in b [:locals :git-data]))
+          (each entry ((git-data :status) :entries)
+            (when (= (entry :type) :untracked)
+              (git/run "add" (entry :path)))))
+        :unstaged
+        (do
+          (def git-data (get-in b [:locals :git-data]))
+          (each entry ((git-data :status) :entries)
+            (when (entry :unstaged)
+              (git/run "add" (entry :path)))))
+        nil)))
 
   (line-select-clear b)
   (do-status-refresh b)
   (hook/fire :git-post-operation :stage [] 0))
 
 (command/defcmd git-unstage
-  "Unstage the file, hunk, or section at point."
+  "Unstage the file, hunk, or section at point.
+  When a line selection spans multiple files, unstages all selected files."
   :label "Unstage"
   []
   (def b (buffer))
@@ -997,45 +1029,54 @@
   (unless item (break))
   (use-buffer-root)
 
-  (case (item :type)
-    :file
-    (when (= (item :status) :staged)
-      (git/run "restore" "--staged" (item :path)))
+  # When line selection covers multiple files, unstage them all
+  (if-let [files (selected-file-items b)]
+    (do
+      (each f files
+        (when (= (f :status) :staged)
+          (git/run "restore" "--staged" (f :path))))
+      (editor/message (string "Unstaged " (length files) " files.")))
 
-    :hunk-header
-    (when (= (item :status) :staged)
-      (def patch (git/make-hunk-patch (item :file-diff) (item :hunk)))
-      (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
-      (if (= (result :exit) 0)
-        (editor/message "Unstaged hunk.")
-        (editor/message (string "Unstage hunk failed: " (result :stderr)))))
+    (case (item :type)
+      :file
+      (when (= (item :status) :staged)
+        (git/run "restore" "--staged" (item :path)))
 
-    :diff-line
-    (when (= (item :status) :staged)
-      (def region (hunk-region-lines b item))
-      (def patch
-        (if region
-          (git/make-region-patch (item :file-diff) (item :hunk)
-                                (region 0) (region 1) true)
-          (git/make-hunk-patch (item :file-diff) (item :hunk))))
-      (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
-      (if (= (result :exit) 0)
-        (editor/message (if region "Unstaged region." "Unstaged hunk."))
-        (editor/message (string "Unstage failed: " (result :stderr)))))
+      :hunk-header
+      (when (= (item :status) :staged)
+        (def patch (git/make-hunk-patch (item :file-diff) (item :hunk)))
+        (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
+        (if (= (result :exit) 0)
+          (editor/message "Unstaged hunk.")
+          (editor/message (string "Unstage hunk failed: " (result :stderr)))))
 
-    :section-heading
-    (when (= (item :status) :staged)
-      (def git-data (get-in b [:locals :git-data]))
-      (each entry ((git-data :status) :entries)
-        (when (entry :staged)
-          (git/run "restore" "--staged" (entry :path))))))
+      :diff-line
+      (when (= (item :status) :staged)
+        (def region (hunk-region-lines b item))
+        (def patch
+          (if region
+            (git/make-region-patch (item :file-diff) (item :hunk)
+                                  (region 0) (region 1) true)
+            (git/make-hunk-patch (item :file-diff) (item :hunk))))
+        (def result (git/run-with-input patch "apply" "--cached" "--reverse"))
+        (if (= (result :exit) 0)
+          (editor/message (if region "Unstaged region." "Unstaged hunk."))
+          (editor/message (string "Unstage failed: " (result :stderr)))))
+
+      :section-heading
+      (when (= (item :status) :staged)
+        (def git-data (get-in b [:locals :git-data]))
+        (each entry ((git-data :status) :entries)
+          (when (entry :staged)
+            (git/run "restore" "--staged" (entry :path)))))))
 
   (line-select-clear b)
   (do-status-refresh b)
   (hook/fire :git-post-operation :unstage [] 0))
 
 (command/defcmd git-discard
-  "Discard changes for the file, hunk, or section at point."
+  "Discard changes for the file, hunk, or section at point.
+  When a line selection spans multiple files, discards all selected files."
   :label "Discard"
   []
   (def b (buffer))
@@ -1058,24 +1099,33 @@
         (git/make-hunk-patch (item :file-diff) (item :hunk))))
     (git/run-with-input patch "apply" "--reverse"))
 
+  (def files (selected-file-items b))
+  (def prompt-msg
+    (if files
+      (string "Discard changes for " (length files) " files? (y/n) ")
+      "Discard changes? (y/n) "))
+
   (prompt/activate
-    {:prompt "Discard changes? (y/n) "
+    {:prompt prompt-msg
      :on-submit
      (with-git-root (fn [input]
        (when (= (string/ascii-lower (string/trim input)) "y")
-         (case (item :type)
-           :file (discard-file (item :path) (item :status))
-           :hunk-header (discard-hunk)
-           :diff-line (discard-hunk)
-           :section-heading
-           (do
-             (def git-data (get-in b [:locals :git-data]))
-             (each entry ((git-data :status) :entries)
-               (when (or (and (= (item :status) :untracked)
-                              (= (entry :type) :untracked))
-                         (and (= (item :status) :unstaged)
-                              (entry :unstaged)))
-                 (discard-file (entry :path) (item :status))))))
+         (if files
+           (each f files
+             (discard-file (f :path) (f :status)))
+           (case (item :type)
+             :file (discard-file (item :path) (item :status))
+             :hunk-header (discard-hunk)
+             :diff-line (discard-hunk)
+             :section-heading
+             (do
+               (def git-data (get-in b [:locals :git-data]))
+               (each entry ((git-data :status) :entries)
+                 (when (or (and (= (item :status) :untracked)
+                                (= (entry :type) :untracked))
+                           (and (= (item :status) :unstaged)
+                                (entry :unstaged)))
+                   (discard-file (entry :path) (item :status)))))))
          (line-select-clear b)
          (do-status-refresh b)
          (hook/fire :git-post-operation :discard [] 0))))}))
