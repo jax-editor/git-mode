@@ -1356,8 +1356,8 @@
   (set commit-buf nil)
   (git-quit))
 
-(keymap/bind commit-keymap "C-c C-c" git-finish-commit)
-(keymap/bind commit-keymap "C-c C-k" git-cancel-commit)
+(keymap/bind commit-keymap "C-c C-c" 'git-finish-commit)
+(keymap/bind commit-keymap "C-c C-k" 'git-cancel-commit)
 
 (defn- open-commit-buffer [&opt amend]
   (def root (dyn :git-root))
@@ -2322,7 +2322,7 @@
            (editor-message (string "Stash pop failed: " (result :stderr)))))))}))
 
 (set stash-item-keymap (keymap/new))
-(keymap/bind stash-item-keymap "A" git-stash-pop-at-point)
+(keymap/bind stash-item-keymap "A" 'git-stash-pop-at-point)
 
 (command/defcmd git-stash-apply
   "Apply the top stash without removing it."
@@ -3053,78 +3053,78 @@
 
 # --- Bind transients to status keymap ---
 
-(keymap/bind status-keymap "c" git-commit-transient)
-(keymap/bind status-keymap "b" git-branch-transient)
-(keymap/bind status-keymap "P" git-push-transient)
-(keymap/bind status-keymap "F" git-pull-transient)
-(keymap/bind status-keymap "f" git-fetch-transient)
-(keymap/bind status-keymap "m" git-merge-transient)
-(keymap/bind status-keymap "r" git-rebase-transient)
-(keymap/bind status-keymap "A" git-cherry-pick-transient)
-(keymap/bind status-keymap "X" git-reset-transient)
-(keymap/bind status-keymap "t" git-tag-transient)
-(keymap/bind status-keymap "l" git-log-transient)
-(keymap/bind status-keymap "d" git-diff-transient)
-(keymap/bind status-keymap "z" git-stash-transient)
+(keymap/bind status-keymap "c" 'git-commit-transient)
+(keymap/bind status-keymap "b" 'git-branch-transient)
+(keymap/bind status-keymap "P" 'git-push-transient)
+(keymap/bind status-keymap "F" 'git-pull-transient)
+(keymap/bind status-keymap "f" 'git-fetch-transient)
+(keymap/bind status-keymap "m" 'git-merge-transient)
+(keymap/bind status-keymap "r" 'git-rebase-transient)
+(keymap/bind status-keymap "A" 'git-cherry-pick-transient)
+(keymap/bind status-keymap "X" 'git-reset-transient)
+(keymap/bind status-keymap "t" 'git-tag-transient)
+(keymap/bind status-keymap "l" 'git-log-transient)
+(keymap/bind status-keymap "d" 'git-diff-transient)
+(keymap/bind status-keymap "z" 'git-stash-transient)
 
 # --- Status keymap: navigation and operations ---
 # Navigation (j/k/gg/G/C-f/C-b/?) inherited from virtual-buffer-keymap.
 
 (def status-g-map (keymap/new))
 (put status-g-map :show-hints true)
-(keymap/bind status-g-map "r" git-refresh)
-(keymap/bind status-g-map "g" move/beginning-of-buffer)
+(keymap/bind status-g-map "r" 'git-refresh)
+(keymap/bind status-g-map "g" 'beginning-of-buffer)
 (keymap/bind status-keymap "g" status-g-map)
-(keymap/bind status-keymap "n" git-next-section)
-(keymap/bind status-keymap "p" git-prev-section)
-(keymap/bind status-keymap "M-n" git-next-sibling)
-(keymap/bind status-keymap "M-p" git-prev-sibling)
-(keymap/bind status-keymap "^" git-section-parent)
-(keymap/bind status-keymap "tab" git-toggle-section)
-(keymap/bind status-keymap "s" git-stage)
-(keymap/bind status-keymap "u" git-unstage)
-(keymap/bind status-keymap "x" git-discard)
-(keymap/bind status-keymap "enter" git-visit)
-(keymap/bind status-keymap "q" git-quit)
-(keymap/bind status-keymap "$" git-process-buffer)
-(keymap/bind status-keymap "`" git-process-buffer)
-(keymap/bind status-keymap "v" git-toggle-line-select)
-(keymap/bind status-keymap "V" git-toggle-line-select)
-(keymap/bind status-keymap "escape" git-clear-selection)
-(keymap/bind status-keymap "C-g" git-clear-selection)
-(keymap/bind status-keymap "j" git-next-line)
-(keymap/bind status-keymap "k" git-prev-line)
-(keymap/bind status-keymap "1" git-visibility-level-1)
-(keymap/bind status-keymap "2" git-visibility-level-2)
-(keymap/bind status-keymap "3" git-visibility-level-3)
-(keymap/bind status-keymap "4" git-visibility-level-4)
+(keymap/bind status-keymap "n" 'git-next-section)
+(keymap/bind status-keymap "p" 'git-prev-section)
+(keymap/bind status-keymap "M-n" 'git-next-sibling)
+(keymap/bind status-keymap "M-p" 'git-prev-sibling)
+(keymap/bind status-keymap "^" 'git-section-parent)
+(keymap/bind status-keymap "tab" 'git-toggle-section)
+(keymap/bind status-keymap "s" 'git-stage)
+(keymap/bind status-keymap "u" 'git-unstage)
+(keymap/bind status-keymap "x" 'git-discard)
+(keymap/bind status-keymap "enter" 'git-visit)
+(keymap/bind status-keymap "q" 'git-quit)
+(keymap/bind status-keymap "$" 'git-process-buffer)
+(keymap/bind status-keymap "`" 'git-process-buffer)
+(keymap/bind status-keymap "v" 'git-toggle-line-select)
+(keymap/bind status-keymap "V" 'git-toggle-line-select)
+(keymap/bind status-keymap "escape" 'git-clear-selection)
+(keymap/bind status-keymap "C-g" 'git-clear-selection)
+(keymap/bind status-keymap "j" 'git-next-line)
+(keymap/bind status-keymap "k" 'git-prev-line)
+(keymap/bind status-keymap "1" 'git-visibility-level-1)
+(keymap/bind status-keymap "2" 'git-visibility-level-2)
+(keymap/bind status-keymap "3" 'git-visibility-level-3)
+(keymap/bind status-keymap "4" 'git-visibility-level-4)
 
 # --- Log keymap bindings ---
 
-(keymap/bind log-keymap "enter" git-log-visit)
-(keymap/bind log-keymap "q" git-quit)
-(keymap/bind log-keymap "n" git-next-section)
-(keymap/bind log-keymap "p" git-prev-section)
-(keymap/bind log-keymap "j" git-next-line)
-(keymap/bind log-keymap "k" git-prev-line)
-(keymap/bind log-keymap "G" move/end-of-buffer)
+(keymap/bind log-keymap "enter" 'git-log-visit)
+(keymap/bind log-keymap "q" 'git-quit)
+(keymap/bind log-keymap "n" 'git-next-section)
+(keymap/bind log-keymap "p" 'git-prev-section)
+(keymap/bind log-keymap "j" 'git-next-line)
+(keymap/bind log-keymap "k" 'git-prev-line)
+(keymap/bind log-keymap "G" 'end-of-buffer)
 (def log-g-map (keymap/new))
-(keymap/bind log-g-map "g" move/beginning-of-buffer)
+(keymap/bind log-g-map "g" 'beginning-of-buffer)
 (keymap/bind log-keymap "g" log-g-map)
-(keymap/bind log-keymap "$" git-process-buffer)
+(keymap/bind log-keymap "$" 'git-process-buffer)
 
 # --- Diff keymap bindings ---
 
-(keymap/bind diff-keymap "q" git-quit)
-(keymap/bind diff-keymap "n" git-next-section)
-(keymap/bind diff-keymap "p" git-prev-section)
-(keymap/bind diff-keymap "j" git-next-line)
-(keymap/bind diff-keymap "k" git-prev-line)
-(keymap/bind diff-keymap "G" move/end-of-buffer)
+(keymap/bind diff-keymap "q" 'git-quit)
+(keymap/bind diff-keymap "n" 'git-next-section)
+(keymap/bind diff-keymap "p" 'git-prev-section)
+(keymap/bind diff-keymap "j" 'git-next-line)
+(keymap/bind diff-keymap "k" 'git-prev-line)
+(keymap/bind diff-keymap "G" 'end-of-buffer)
 (def diff-g-map (keymap/new))
-(keymap/bind diff-g-map "g" move/beginning-of-buffer)
+(keymap/bind diff-g-map "g" 'beginning-of-buffer)
 (keymap/bind diff-keymap "g" diff-g-map)
-(keymap/bind diff-keymap "$" git-process-buffer)
+(keymap/bind diff-keymap "$" 'git-process-buffer)
 
 # ════════════════════════════════════════════════════════════════════
 # Copy / yank commands
@@ -3267,8 +3267,8 @@
 
 # --- Copy keybindings (Emacs/Magit convention: C-w and M-w) ---
 (each km [status-keymap log-keymap diff-keymap]
-  (keymap/bind km "C-w" git-copy-section-value)
-  (keymap/bind km "M-w" git-copy-buffer-revision))
+  (keymap/bind km "C-w" 'git-copy-section-value)
+  (keymap/bind km "M-w" 'git-copy-buffer-revision))
 
 # ════════════════════════════════════════════════════════════════════
 # Commands & global keybindings
@@ -3329,8 +3329,8 @@
 # --- Global keybindings ---
 
 (def global-km (editor/global-keymap))
-(keymap/bind global-km "C-x g" git-status)
-(keymap/bind global-km "C-x G" git-dispatch)
+(keymap/bind global-km "C-x g" 'git-status)
+(keymap/bind global-km "C-x G" 'git-dispatch)
 
 # --- Debounced refresh on save ---
 
@@ -3384,17 +3384,17 @@
     (when-let [status-mode (mode/get-mode :git-status)
                resolved (mode/resolve-keymap status-mode)]
       (def status-km (if (indexed? resolved) (last resolved) resolved))
-      (keymap/bind status-km "`" git-process-buffer))
+      (keymap/bind status-km "`" 'git-process-buffer))
 
     (each mode-name [:git-status :git-log :git-diff]
       (when-let [m (mode/get-mode mode-name)
                  resolved (mode/resolve-keymap m)]
         (def km (if (indexed? resolved) (last resolved) resolved))
         (let [y-map (keymap/new)]
-          (keymap/bind y-map "s" git-copy-section-value)
-          (keymap/bind y-map "b" git-copy-buffer-revision)
-          (keymap/bind y-map "r" git-show-refs)
-          (keymap/bind y-map "y" git-yank-whole-line)
+          (keymap/bind y-map "s" 'git-copy-section-value)
+          (keymap/bind y-map "b" 'git-copy-buffer-revision)
+          (keymap/bind y-map "r" 'git-show-refs)
+          (keymap/bind y-map "y" 'git-yank-whole-line)
           (keymap/bind km "y" y-map))))
 
     (bind-group "p" nil

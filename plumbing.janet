@@ -46,7 +46,7 @@
   (def p (state :current-pane))
   (when p
     (db/quit-window p state)))
-(keymap/bind process-keymap "q" git-process-quit)
+(keymap/bind process-keymap "q" 'git-process-quit)
 
 (def process-mode
   @{:name "git-process"
